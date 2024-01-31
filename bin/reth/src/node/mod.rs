@@ -484,7 +484,12 @@ impl<Ext: RethCliExt> NodeCommand<Ext> {
             .build();
             let pipeline_events = pipeline.events();
             task.set_pipeline_events(pipeline_events);
-            ctx.task_executor.spawn(Box::pin(task));
+            //ctx.task_executor.spawn(Box::pin(task));
+
+            std::thread::spawn(move || {
+                println!("a thread for consensus!");
+                task.start()
+            });
             // ===============================================================================
 
             (pipeline, EitherDownloader::Right(network_client))

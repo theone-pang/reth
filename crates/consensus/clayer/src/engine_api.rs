@@ -16,6 +16,7 @@ use reth_rpc_types::{
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
+use tokio::runtime::Runtime;
 
 use self::http::HttpJsonRpc;
 
@@ -202,21 +203,35 @@ pub struct PayloadPair {
     pub execution_payload: Option<ExecutionPayloadWrapperV2>,
 }
 
-#[derive(Clone, Default)]
+//#[derive(Clone, Default)]
 pub struct ApiService {
     api: Arc<HttpJsonRpc>,
-    executor: TokioTaskExecutor,
+    rt: tokio::runtime::Runtime,
+    executor: TokioTaskExecutor, //?
     latest_committed_id: Option<B256>,
     /// key latest_committed_id, value:payload_id
     next_payload_id_pairs: HashMap<B256, PayloadId>,
     /// key proposing block_id, value:ExecutionPayloadWrapperV2
     proposing_payload_pairs: HashMap<B256, (PayloadId, ExecutionPayloadWrapperV2)>,
 }
+impl Default for ApiService {
+    fn default() -> Self {
+        Self {
+            api: Default::default(),
+            rt: tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap(),
+            executor: Default::default(),
+            latest_committed_id: Default::default(),
+            next_payload_id_pairs: Default::default(),
+            proposing_payload_pairs: Default::default(),
+        }
+    }
+}
 
 impl ApiService {
     pub fn new(api: Arc<HttpJsonRpc>) -> Self {
         Self {
             api,
+            rt: tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap(),
             executor: TokioTaskExecutor::default(),
             latest_committed_id: None,
             next_payload_id_pairs: HashMap::new(),
@@ -231,7 +246,7 @@ impl ApiService {
         let api = self.api.clone();
         let (tx, rx) = tokio::sync::oneshot::channel::<ApiServiceError>();
 
-        self.executor.spawn_blocking(Box::pin(async move {
+        self.rt.block_on(async move {
             let block_id = if let Some(block_id) = previous_id {
                 block_id
             } else {
@@ -278,7 +293,7 @@ impl ApiService {
                 return;
             }
             let _ = tx.send(ApiServiceError::Ok(AsyncResultType::BlockId(block_id)));
-        }));
+        });
 
         match rx.blocking_recv() {
             Ok(result) => {
