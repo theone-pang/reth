@@ -113,6 +113,24 @@ impl<Client, Pool: TransactionPool, CDB> ClTask<Client, Pool, CDB> {
     }
 }
 
+impl<Client, Pool, CDB> ClTask<Client, Pool, CDB>
+where
+    Client: StateProviderFactory + CanonChainTracker + Clone + 'static,
+    Pool: TransactionPool + 'static,
+    <Pool as TransactionPool>::Transaction: IntoRecoveredTransaction,
+    CDB: ConsensusNumberReader + ConsensusNumberWriter,
+{
+    pub fn start(&mut self) {
+        loop {
+            println!("start consensus layer!!!");
+            let sec = std::time::Duration::from_millis(1000);
+            std::thread::sleep(sec);
+
+            let _ = ApiService::new(self.api.clone()).initialize_block(None);
+        }
+    }
+}
+
 impl<Client, Pool, CDB> Future for ClTask<Client, Pool, CDB>
 where
     Client: StateProviderFactory + CanonChainTracker + Clone + Unpin + 'static,
