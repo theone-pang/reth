@@ -20,8 +20,8 @@ use itertools::Itertools;
 use reth_ecies::util::id2pk;
 use reth_eth_wire::{
     ClayerBlock, ClayerConsensusMessage, ClayerConsensusMessageHeader, ClayerExecutionPayload,
-    ClayerSignature, PbftMessage, PbftMessageInfo, PbftMessageType, PbftNewView, PbftSeal,
-    PbftSignedVote,
+    ClayerSignature, PbftMessage, PbftMessageInfo, PbftMessageType, PbftNewValidator, PbftNewView,
+    PbftSeal, PbftSignedVote,
 };
 use reth_interfaces::clayer::{ClayerConsensusEvent, ClayerConsensusMessageAgentTrait};
 use reth_primitives::{
@@ -36,8 +36,10 @@ use tracing::*;
 
 use crate::{
     engine_api::{ApiService, ExecutionPayloadWrapperV2},
-    timing::Timeout,
+    timing::{retry_until_ok, Timeout},
 };
+
+pub const ELECT_VOTING_ADDRESS: &str = "0x0000000000000000000000000000000000001000";
 
 pub struct ClayerConsensusMessagingAgent {
     pub inner: Arc<parking_lot::RwLock<ClayerConsensusMessagingAgentInner>>,
@@ -261,6 +263,12 @@ where
             match msg_type {
                 PbftMessageType::AnnounceBlock => {
                     self.handle_announceblock_response(&msg, state)?
+                }
+                PbftMessageType::NewValidator => self.handle_new_validator(&msg, state)?,
+                PbftMessageType::Seal => {
+                    if state.becoming_validator {
+                        self.handle_seal_response(&msg, state)?
+                    }
                 }
                 _ => {
                     warn!(target: "consensus::cl","Received message with validiator type: {:?}", msg_type)
@@ -603,7 +611,12 @@ where
 
             trace!(target: "consensus::cl","Created NewView message: {:?}", new_view);
 
-            self.broadcast_message(ParsedMessage::from_new_view_message(new_view)?, state, false)?;
+            self.broadcast_message(
+                ParsedMessage::from_new_view_message(new_view),
+                state,
+                false,
+                true,
+            )?;
         }
 
         Ok(())
@@ -687,6 +700,8 @@ where
             let result = self.load_seal(msg.get_pbft().block_id)?;
             if let Some(seal) = result {
                 return self.send_seal_response_v2(state, &peer_id, &seal);
+            } else {
+                warn!(target: "consensus::cl","can not load seal from block {}", msg.get_pbft().block_id);
             }
         }
         Ok(())
@@ -784,21 +799,60 @@ where
         Ok(())
     }
 
+    fn handle_new_validator(
+        &mut self,
+        msg: &ParsedMessage,
+        state: &mut PbftState,
+    ) -> Result<(), PbftError> {
+        let peerid = msg.get_new_validator();
+
+        info!(target: "consensus::cl","trace sync handle_new_validator: state.becoming_validator {}",state.becoming_validator);
+
+        if state.id == peerid && state.becoming_validator == false {
+            state.becoming_validator = true;
+            // self.sync_seal(state)?
+        }
+        Ok(())
+    }
+
     pub fn sync_seal(&mut self, state: &mut PbftState) -> Result<(), PbftError> {
-        if state.is_validator() {
+        let now: u64 = chrono::prelude::Local::now().timestamp() as u64;
+        let interval = now - state.last_send_seal_timestamp;
+        if state.block_publishing_min_interval.as_secs() > interval {
+            return Ok(());
+        }
+        state.last_send_seal_timestamp = now;
+
+        if state.is_validator() || state.becoming_validator == true {
+            let mut request_count: u64 = 0;
             let state_seq_num = state.seq_num;
+            let mut has_send_seal = state.has_send_seal;
             let latest_db_header = self.client.latest_header().ok().flatten();
             if let Some(latest_db_header) = latest_db_header {
                 if latest_db_header.number >= state_seq_num {
+                    //info!(target: "consensus::cl","trace sync state_seq_num {}, latest_db_header.number {} has_send_seal {}",state_seq_num,latest_db_header.number,has_send_seal);
                     for seq in state_seq_num..=latest_db_header.number {
-                        let header =
-                            self.client.sealed_header_by_id(BlockId::from(seq)).ok().flatten();
-                        if let Some(header) = header {
-                            trace!(target: "consensus::cl", "trace sync:seal reqeust {} {} latest_number {} state_seq_num {}",header.number,header.hash,latest_db_header.number,state_seq_num);
-                            self.send_seal_request(state, header.hash)?;
-                            self.msg_log.add_validated_block(clayer_block_from_header(&header));
+                        // info!(target: "consensus::cl","trace sync:seal reqeust seq {} has_send_seal {} ====",seq,has_send_seal);
+                        if seq > has_send_seal {
+                            let header =
+                                self.client.sealed_header_by_id(BlockId::from(seq)).ok().flatten();
+                            if let Some(header) = header {
+                                info!(target: "consensus::cl", "trace sync:seal reqeust {} {} has_send_seal {} latest_number {} state_seq_num {}",header.number,header.hash,has_send_seal,latest_db_header.number,state_seq_num);
+                                self.send_seal_request(state, header.hash)?;
+                                self.msg_log.add_validated_block(clayer_block_from_header(&header));
+                                // info!(target: "consensus::cl", "trace sync:seal reqeust sended");
+                                has_send_seal = header.number;
+                                request_count = request_count + 1;
+                                if request_count >= 100 {
+                                    break;
+                                }
+                            } else {
+                                warn!(target: "consensus::cl", "trace sync:seal reqeust {} header not found",seq);
+                                break;
+                            }
                         }
                     }
+                    state.has_send_seal = has_send_seal;
                 }
             }
         }
@@ -1036,9 +1090,18 @@ where
         let latest_number = if let Some(latest_header) = latest_header {
             latest_header.header.number
         } else {
-            return Err(PbftError::InternalError(format!(
-                "Failed to get latest header with catch-up"
-            )));
+            // Commit the block, stop the idle timeout, and skip straight to Finishing
+            let payload = self.service.commit_block(seal.block_id.clone()).map_err(|err| {
+                PbftError::ServiceError(
+                    format!(
+                        "Failed to commit block with catch-up {:?} / {:?}",
+                        state.seq_num,
+                        hex::encode(&seal.block_id)
+                    ),
+                    err.to_string(),
+                )
+            })?;
+            payload.execution_payload.payload_inner.timestamp
         };
 
         let header = self.client.header_by_id(BlockId::from(seal.block_id.clone())).ok().flatten();
@@ -1146,7 +1209,7 @@ where
         }
 
         // Update membership if necessary
-        self.update_membership(block_id.clone(), state);
+        self.update_membership(block_id.clone(), state.seq_num - 1, state);
 
         // Increment the view if a view change must be forced for fairness view
         if state.at_forced_view_change() {
@@ -1224,11 +1287,25 @@ where
     /// # Panics
     /// + If the `sawtooth.consensus.pbft.members` setting is unset or invalid
     /// + If the network this node is on does not have enough nodes to be Byzantine fault tolernant
-    fn update_membership(&mut self, block_id: B256, state: &mut PbftState) {
+    fn update_membership(&mut self, block_id: B256, block_number: u64, state: &mut PbftState) {
         trace!(target: "consensus::cl","Updating membership for block {}",block_id);
 
-        let on_chain_members = state.validators.member_ids().clone();
+        let last_is_validator = state.is_validator();
 
+        // let on_chain_members = state.validators.member_ids().clone();
+
+        let on_chain_members =
+            retry_until_ok(state.exponential_retry_base, state.exponential_retry_max, || {
+                self.service.query_validators(ELECT_VOTING_ADDRESS.to_string(), block_number)
+            });
+
+        let on_chain_members: Vec<PeerId> =
+            assemble_peer_id(on_chain_members).unwrap_or_else(|err| {
+                error!(target: "consensus::cl","Failed to parse members on-chain: {}", err);
+                state.validators.member_ids().clone()
+            });
+
+        let (add_or_sub, peerid) = state.validators.compare(&on_chain_members);
         if !state.validators.is_same(&on_chain_members) {
             info!(target: "consensus::cl","Updating membership: {:?}", on_chain_members);
             state.validators.update(&on_chain_members);
@@ -1237,6 +1314,27 @@ where
                 panic!("This network no longer contains enough nodes to be fault tolerant");
             }
             state.f = f as u64;
+        }
+
+        // broadcast to new validator
+        if last_is_validator && state.is_validator() && add_or_sub > 0 {
+            let info = PbftMessageInfo {
+                ptype: PbftMessageType::NewValidator as u8,
+                view: state.view,
+                seq_num: block_number,
+                signer_id: state.id.clone(),
+            };
+            let msg = PbftNewValidator { info, peerid };
+            let _ = self.broadcast_message(
+                ParsedMessage::from_new_validator_message(msg),
+                state,
+                false,
+                true,
+            );
+        }
+
+        if state.is_validator() && state.becoming_validator {
+            state.becoming_validator = false;
         }
     }
 
@@ -1712,7 +1810,14 @@ where
         // network at the time this block was voted on.
         trace!(target: "consensus::cl","Getting members for block {} to verify seal",previous_id);
         // get previous_id setting
-        let members = state.validators.member_ids();
+        // let members = state.validators.member_ids();
+
+        let on_chain_validators =
+            retry_until_ok(state.exponential_retry_base, state.exponential_retry_max, || {
+                self.service
+                    .query_validators(ELECT_VOTING_ADDRESS.to_string(), seal.info.seq_num - 1)
+            });
+        let members: Vec<PeerId> = assemble_peer_id(on_chain_validators)?;
 
         // Verify that the seal's signer is a PBFT member
         if !members.contains(&seal.info.signer_id) {
@@ -1770,7 +1875,7 @@ where
         info!(target: "consensus::cl","===================================try_publish============================================");
         info!(target: "consensus::cl","{}: Try publish proposal", state);
 
-        match self.service.summarize_block() {
+        match self.service.summarize_block(state.seq_num, state.validators.accounts()) {
             Ok(_) => {}
             Err(err) => {
                 info!("Couldn't summarize, so not finalizing: {}", err);
@@ -1859,7 +1964,12 @@ where
             to_all = true;
         }
 
-        self.broadcast_message(ParsedMessage::from_pbft_message(msg)?, state, to_all)
+        let mut to_self = true;
+        if msg_type == PbftMessageType::SealRequest {
+            to_self = false;
+        }
+
+        self.broadcast_message(ParsedMessage::from_pbft_message(msg)?, state, to_all, to_self)
     }
 
     /// Broadcast the specified message to all of the node's peers, including itself
@@ -1868,6 +1978,7 @@ where
         msg: ParsedMessage,
         state: &mut PbftState,
         to_all: bool,
+        to_self: bool,
     ) -> Result<(), PbftError> {
         // Broadcast to peers
         let message_bytes = msg.get_message_bytes();
@@ -1905,7 +2016,11 @@ where
             self.agent.broadcast_consensus(state.validators.member_ids().clone(), msg_bytes);
 
             // Send to self
-            self.on_peer_message(state.id.clone(), msg, state)
+            if to_self {
+                self.on_peer_message(state.id.clone(), msg, state)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -1930,7 +2045,7 @@ where
 
         trace!(target: "consensus::cl","{}: Created BlockNew message: {:?}", state, msg);
 
-        self.broadcast_message(ParsedMessage::from_block_new_message(msg)?, state, false)
+        self.broadcast_message(ParsedMessage::from_block_new_message(msg), state, false, true)
     }
 
     /// Build a consensus seal for the last block this node committed and send it to the node that
@@ -2265,6 +2380,36 @@ pub fn clayer_block_from_seal(header: &SealedHeader, seal: PbftSeal) -> ClayerBl
     let message_bytes = reth_primitives::Bytes::copy_from_slice(msg_out.as_slice());
 
     ClayerBlock { info, block, seal_bytes: message_bytes, payload_id: B64::ZERO }
+}
+
+pub fn assemble_peer_id(datas: Vec<Vec<u8>>) -> Result<Vec<PeerId>, PbftError> {
+    if datas.is_empty() {
+        error!(target: "consensus::cl","The number of elect contract returns must be not 0");
+        return Err(PbftError::FaultyPrimary(format!(
+            "The number of elect contract returns must be not 0"
+        )));
+    }
+    if datas.len() % 2 != 0 {
+        error!(target: "consensus::cl","The number of elect contract returns must be even");
+        return Err(PbftError::FaultyPrimary(format!(
+            "The number of elect contract returns must be even"
+        )));
+        // panic!("The number of elect contract returns must be even");
+    }
+    let mut peers = Vec::new();
+    let mut bytes = Vec::new();
+    for (i, item) in datas.iter().enumerate() {
+        if i % 2 == 0 {
+            bytes.extend_from_slice(item);
+        } else {
+            bytes.extend_from_slice(item);
+            let id = PeerId::from_slice(&bytes);
+            info!(target: "consensus::cl","peer id: {}",  id);
+            peers.push(id);
+            bytes.clear();
+        }
+    }
+    Ok(peers)
 }
 
 #[cfg(test)]

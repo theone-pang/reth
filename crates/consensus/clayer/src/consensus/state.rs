@@ -103,6 +103,13 @@ pub struct PbftState {
 
     /// Last timestamp of the node's chain head
     pub last_block_timestamp: u64,
+
+    /// A Not validator become validator
+    pub becoming_validator: bool,
+
+    /// for seal
+    pub last_send_seal_timestamp: u64,
+    pub has_send_seal: u64,
 }
 
 impl fmt::Display for PbftState {
@@ -156,6 +163,9 @@ impl PbftState {
             forced_view_change_interval: config.forced_view_change_interval,
             block_publishing_min_interval: config.block_publishing_min_interval,
             last_block_timestamp,
+            becoming_validator: false,
+            last_send_seal_timestamp: 0,
+            has_send_seal: 0,
         }
     }
     /// Obtain the ID for the primary node in the network
@@ -213,5 +223,14 @@ impl PbftState {
 
     pub fn at_forced_view_change(&self) -> bool {
         self.seq_num % self.forced_view_change_interval == 0
+    }
+
+    pub fn update_members(&mut self, members: &Vec<PeerId>) {
+        self.validators.update(members);
+        let f = (self.validators.len() - 1) / 3;
+        if f == 0 {
+            panic!("This network no longer contains enough nodes to be fault tolerant");
+        }
+        self.f = f as u64;
     }
 }
