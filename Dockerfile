@@ -39,6 +39,8 @@ COPY --from=builder /app/reth /usr/local/bin
 
 # Copy licenses
 COPY LICENSE-* ./
+COPY deploy/genesis.json ./genesis.json
+COPY deploy/secrets ./secrets
 
 EXPOSE 30303 30303/udp 9001 8545 8546
 ENTRYPOINT ["/usr/local/bin/reth"]
