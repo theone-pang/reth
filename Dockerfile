@@ -36,6 +36,8 @@ WORKDIR /app
 
 # Copy reth over from the build stage
 COPY --from=builder /app/reth /usr/local/bin
+COPY deploy/genesis.json ./genesis.json
+COPY deploy/secrets ./secrets
 
 # Copy licenses
 COPY LICENSE-* ./
