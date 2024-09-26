@@ -1,21 +1,3 @@
-use crate::{
-    config::NetworkMode, discovery::DiscoveryEvent, manager::NetworkEvent, message::PeerRequest,
-    peers::PeersHandle, protocol::RlpxSubProtocol, FetchClient,
-};
-use async_trait::async_trait;
-use parking_lot::Mutex;
-use reth_eth_wire::{
-    ClayerConsensusMsg, DisconnectReason, NewBlock, NewPooledTransactionHashes, SharedTransactions,
-};
-use reth_interfaces::sync::{NetworkSyncUpdater, SyncState, SyncStateProvider};
-use reth_net_common::bandwidth_meter::BandwidthMeter;
-use reth_network_api::{
-    NetworkError, NetworkInfo, PeerInfo, PeerKind, Peers, PeersInfo, Reputation,
-    ReputationChangeKind,
-};
-use reth_primitives::{Head, NodeRecord, PeerId, TransactionSigned, B256};
-use reth_rpc_types::NetworkStatus;
-use secp256k1::SecretKey;
 use std::{
     net::SocketAddr,
     sync::{
@@ -23,8 +5,40 @@ use std::{
         Arc,
     },
 };
-use tokio::sync::{mpsc, mpsc::UnboundedSender, oneshot};
+
+use alloy_primitives::B256;
+use enr::Enr;
+use parking_lot::Mutex;
+use reth_discv4::Discv4;
+use reth_discv5::Discv5;
+use reth_eth_wire::{
+    ClayerConsensusMsg, DisconnectReason, NewBlock, NewPooledTransactionHashes, SharedTransactions,
+};
+use reth_network_api::{
+    test_utils::{PeersHandle, PeersHandleProvider},
+    BlockDownloaderProvider, DiscoveryEvent, NetworkError, NetworkEvent,
+    NetworkEventListenerProvider, NetworkInfo, NetworkSecretKey, NetworkStatus, PeerInfo,
+    PeerRequest, Peers, PeersInfo,
+};
+use reth_network_p2p::{
+    sync::{NetworkSyncUpdater, SyncState, SyncStateProvider},
+    BlockClient,
+};
+use reth_network_peers::{NodeRecord, PeerId};
+use reth_network_types::{PeerAddr, PeerKind, Reputation, ReputationChangeKind};
+use reth_primitives::{Head, TransactionSigned};
+use reth_tokio_util::{EventSender, EventStream};
+use secp256k1::SecretKey;
+use tokio::sync::{
+    mpsc::{self, UnboundedSender},
+    oneshot,
+};
 use tokio_stream::wrappers::UnboundedReceiverStream;
+
+use crate::{
+    config::NetworkMode, protocol::RlpxSubProtocol, swarm::NetworkConnectionState,
+    transactions::TransactionsHandle, FetchClient,
+};
 
 /// A _shareable_ network frontend. Used to interact with the network.
 ///
@@ -48,10 +62,11 @@ impl NetworkHandle {
         local_peer_id: PeerId,
         peers: PeersHandle,
         network_mode: NetworkMode,
-        bandwidth_meter: BandwidthMeter,
         chain_id: Arc<AtomicU64>,
         tx_gossip_disabled: bool,
-        #[cfg(feature = "optimism")] sequencer_endpoint: Option<String>,
+        discv4: Option<Discv4>,
+        discv5: Option<Discv5>,
+        event_sender: EventSender<NetworkEvent>,
     ) -> Self {
         let inner = NetworkInner {
             num_active_peers,
@@ -61,13 +76,13 @@ impl NetworkHandle {
             local_peer_id,
             peers,
             network_mode,
-            bandwidth_meter,
             is_syncing: Arc::new(AtomicBool::new(false)),
             initial_sync_done: Arc::new(AtomicBool::new(false)),
             chain_id,
             tx_gossip_disabled,
-            #[cfg(feature = "optimism")]
-            sequencer_endpoint,
+            discv4,
+            discv5,
+            event_sender,
         };
         Self { inner: Arc::new(inner) }
     }
@@ -77,24 +92,8 @@ impl NetworkHandle {
         &self.inner.local_peer_id
     }
 
-    /// Returns the [`PeersHandle`] that can be cloned and shared.
-    ///
-    /// The [`PeersHandle`] can be used to interact with the network's peer set.
-    pub fn peers_handle(&self) -> &PeersHandle {
-        &self.inner.peers
-    }
-
     fn manager(&self) -> &UnboundedSender<NetworkHandleMessage> {
         &self.inner.to_manager_tx
-    }
-
-    /// Returns a new [`FetchClient`] that can be cloned and shared.
-    ///
-    /// The [`FetchClient`] is the entrypoint for sending requests to the network.
-    pub async fn fetch_client(&self) -> Result<FetchClient, oneshot::error::RecvError> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self.manager().send(NetworkHandleMessage::FetchClient(tx));
-        rx.await
     }
 
     /// Returns the mode of the network, either pow, or pos
@@ -114,9 +113,9 @@ impl NetworkHandle {
 
     /// Announce a block over devp2p
     ///
-    /// Caution: in PoS this is a noop, since new block are no longer announced over devp2p, but are
-    /// instead sent to node node by the CL. However, they can still be requested over devp2p, but
-    /// broadcasting them is a considered a protocol violation..
+    /// Caution: in `PoS` this is a noop because new blocks are no longer announced over devp2p.
+    /// Instead they are sent to the node by CL and can be requested over devp2p.
+    /// Broadcasting new blocks is considered a protocol violation.
     pub fn announce_block(&self, block: NewBlock, hash: B256) {
         self.send_message(NetworkHandleMessage::AnnounceBlock(block, hash))
     }
@@ -139,9 +138,13 @@ impl NetworkHandle {
         })
     }
 
-    /// Provides a shareable reference to the [`BandwidthMeter`] stored on the `NetworkInner`.
-    pub fn bandwidth_meter(&self) -> &BandwidthMeter {
-        &self.inner.bandwidth_meter
+    /// Send message to get the [`TransactionsHandle`].
+    ///
+    /// Returns `None` if no transaction task is installed.
+    pub async fn transactions_handle(&self) -> Option<TransactionsHandle> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.manager().send(NetworkHandleMessage::GetTransactionsHandle(tx));
+        rx.await.unwrap()
     }
 
     /// Send message to gracefully shutdown node.
@@ -154,6 +157,25 @@ impl NetworkHandle {
         rx.await
     }
 
+    /// Set network connection state to Active.
+    ///
+    /// New outbound connections will be established if there's capacity.
+    pub fn set_network_active(&self) {
+        self.set_network_conn(NetworkConnectionState::Active);
+    }
+
+    /// Set network connection state to Hibernate.
+    ///
+    /// No new outbound connections will be established.
+    pub fn set_network_hibernate(&self) {
+        self.set_network_conn(NetworkConnectionState::Hibernate);
+    }
+
+    /// Set network connection state.
+    fn set_network_conn(&self, network_conn: NetworkConnectionState) {
+        self.send_message(NetworkHandleMessage::SetNetworkState(network_conn));
+    }
+
     /// Whether tx gossip is disabled
     pub fn tx_gossip_disabled(&self) -> bool {
         self.inner.tx_gossip_disabled
@@ -164,7 +186,7 @@ impl NetworkHandle {
         &self.inner.secret_key
     }
 
-    ///
+    /// Send full consensus to the peer
     pub fn send_consensus(&self, peer_id: PeerId, msg: reth_primitives::Bytes) {
         self.send_message(NetworkHandleMessage::SendConsensus {
             peer_id,
@@ -173,13 +195,17 @@ impl NetworkHandle {
     }
 }
 
+impl NetworkSecretKey for NetworkHandle {
+    fn network_secret_key(&self) -> &SecretKey {
+        &self.inner.secret_key
+    }
+}
+
 // === API Implementations ===
 
-impl NetworkEvents for NetworkHandle {
-    fn event_listener(&self) -> UnboundedReceiverStream<NetworkEvent> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let _ = self.manager().send(NetworkHandleMessage::EventListener(tx));
-        UnboundedReceiverStream::new(rx)
+impl NetworkEventListenerProvider for NetworkHandle {
+    fn event_listener(&self) -> EventStream<NetworkEvent> {
+        self.inner.event_sender.new_listener()
     }
 
     fn discovery_listener(&self) -> UnboundedReceiverStream<DiscoveryEvent> {
@@ -201,27 +227,57 @@ impl PeersInfo for NetworkHandle {
     }
 
     fn local_node_record(&self) -> NodeRecord {
-        let id = *self.peer_id();
-        let mut socket_addr = *self.inner.listener_address.lock();
+        if let Some(discv4) = &self.inner.discv4 {
+            discv4.node_record()
+        } else if let Some(record) = self.inner.discv5.as_ref().and_then(|d| d.node_record()) {
+            record
+        } else {
+            let id = *self.peer_id();
+            let mut socket_addr = *self.inner.listener_address.lock();
 
-        if socket_addr.ip().is_unspecified() {
-            // zero address is invalid
-            if socket_addr.ip().is_ipv4() {
-                socket_addr.set_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-            } else {
-                socket_addr.set_ip(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+            if socket_addr.ip().is_unspecified() {
+                // zero address is invalid
+                if socket_addr.ip().is_ipv4() {
+                    socket_addr.set_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                } else {
+                    socket_addr.set_ip(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+                }
             }
-        }
 
-        NodeRecord::new(socket_addr, id)
+            NodeRecord::new(socket_addr, id)
+        }
+    }
+
+    fn local_enr(&self) -> Enr<SecretKey> {
+        let local_node_record = self.local_node_record();
+        let mut builder = Enr::builder();
+        builder.ip(local_node_record.address);
+        if local_node_record.address.is_ipv4() {
+            builder.udp4(local_node_record.udp_port);
+            builder.tcp4(local_node_record.tcp_port);
+        } else {
+            builder.udp6(local_node_record.udp_port);
+            builder.tcp6(local_node_record.tcp_port);
+        }
+        builder.build(&self.inner.secret_key).expect("valid enr")
     }
 }
 
-#[async_trait]
 impl Peers for NetworkHandle {
+    fn add_trusted_peer_id(&self, peer: PeerId) {
+        self.send_message(NetworkHandleMessage::AddTrustedPeerId(peer));
+    }
+
     /// Sends a message to the [`NetworkManager`](crate::NetworkManager) to add a peer to the known
     /// set, with the given kind.
-    fn add_peer_kind(&self, peer: PeerId, kind: PeerKind, addr: SocketAddr) {
+    fn add_peer_kind(
+        &self,
+        peer: PeerId,
+        kind: PeerKind,
+        tcp_addr: SocketAddr,
+        udp_addr: Option<SocketAddr>,
+    ) {
+        let addr = PeerAddr::new(tcp_addr, udp_addr);
         self.send_message(NetworkHandleMessage::AddPeerAddress(peer, kind, addr));
     }
 
@@ -267,6 +323,22 @@ impl Peers for NetworkHandle {
         self.send_message(NetworkHandleMessage::DisconnectPeer(peer, Some(reason)))
     }
 
+    /// Sends a message to the [`NetworkManager`](crate::NetworkManager) to connect to the given
+    /// peer.
+    fn connect_peer_kind(
+        &self,
+        peer_id: PeerId,
+        kind: PeerKind,
+        tcp_addr: SocketAddr,
+        udp_addr: Option<SocketAddr>,
+    ) {
+        self.send_message(NetworkHandleMessage::ConnectPeer(
+            peer_id,
+            kind,
+            PeerAddr::new(tcp_addr, udp_addr),
+        ))
+    }
+
     /// Send a reputation change for the given peer.
     fn reputation_change(&self, peer_id: PeerId, kind: ReputationChangeKind) {
         self.send_message(NetworkHandleMessage::ReputationChange(peer_id, kind));
@@ -279,7 +351,12 @@ impl Peers for NetworkHandle {
     }
 }
 
-#[async_trait]
+impl PeersHandleProvider for NetworkHandle {
+    fn peers_handle(&self) -> &PeersHandle {
+        &self.inner.peers
+    }
+}
+
 impl NetworkInfo for NetworkHandle {
     fn local_addr(&self) -> SocketAddr {
         *self.inner.listener_address.lock()
@@ -301,11 +378,6 @@ impl NetworkInfo for NetworkHandle {
 
     fn is_initially_syncing(&self) -> bool {
         SyncStateProvider::is_initially_syncing(self)
-    }
-
-    #[cfg(feature = "optimism")]
-    fn sequencer_endpoint(&self) -> Option<&str> {
-        self.inner.sequencer_endpoint.as_deref()
     }
 }
 
@@ -338,6 +410,14 @@ impl NetworkSyncUpdater for NetworkHandle {
     }
 }
 
+impl BlockDownloaderProvider for NetworkHandle {
+    async fn fetch_client(&self) -> Result<impl BlockClient + 'static, oneshot::error::RecvError> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.manager().send(NetworkHandleMessage::FetchClient(tx));
+        rx.await
+    }
+}
+
 #[derive(Debug)]
 struct NetworkInner {
     /// Number of active peer sessions the node's currently handling.
@@ -354,8 +434,6 @@ struct NetworkInner {
     peers: PeersHandle,
     /// The mode of the network
     network_mode: NetworkMode,
-    /// Used to measure inbound & outbound bandwidth across network streams (currently unused)
-    bandwidth_meter: BandwidthMeter,
     /// Represents if the network is currently syncing.
     is_syncing: Arc<AtomicBool>,
     /// Used to differentiate between an initial pipeline sync or a live sync
@@ -364,76 +442,87 @@ struct NetworkInner {
     chain_id: Arc<AtomicU64>,
     /// Whether to disable transaction gossip
     tx_gossip_disabled: bool,
-    /// The sequencer HTTP Endpoint
-    #[cfg(feature = "optimism")]
-    sequencer_endpoint: Option<String>,
-}
-
-/// Provides event subscription for the network.
-pub trait NetworkEvents: Send + Sync {
-    /// Creates a new [`NetworkEvent`] listener channel.
-    fn event_listener(&self) -> UnboundedReceiverStream<NetworkEvent>;
-    /// Returns a new [`DiscoveryEvent`] stream.
-    ///
-    /// This stream yields [`DiscoveryEvent`]s for each peer that is discovered.
-    fn discovery_listener(&self) -> UnboundedReceiverStream<DiscoveryEvent>;
+    /// The instance of the discv4 service
+    discv4: Option<Discv4>,
+    /// The instance of the discv5 service
+    discv5: Option<Discv5>,
+    /// Sender for high level network events.
+    event_sender: EventSender<NetworkEvent>,
 }
 
 /// Provides access to modify the network's additional protocol handlers.
 pub trait NetworkProtocols: Send + Sync {
-    /// Adds an additional protocol handler to the RLPx sub-protocol list.
+    /// Adds an additional protocol handler to the `RLPx` sub-protocol list.
     fn add_rlpx_sub_protocol(&self, protocol: RlpxSubProtocol);
 }
 
 /// Internal messages that can be passed to the  [`NetworkManager`](crate::NetworkManager).
-#[allow(missing_docs)]
 #[derive(Debug)]
 pub(crate) enum NetworkHandleMessage {
-    /// Adds an address for a peer.
-    AddPeerAddress(PeerId, PeerKind, SocketAddr),
+    /// Marks a peer as trusted.
+    AddTrustedPeerId(PeerId),
+    /// Adds an address for a peer, including its ID, kind, and socket address.
+    AddPeerAddress(PeerId, PeerKind, PeerAddr),
     /// Removes a peer from the peerset corresponding to the given kind.
     RemovePeer(PeerId, PeerKind),
-    /// Disconnect a connection to a peer if it exists.
+    /// Disconnects a connection to a peer if it exists, optionally providing a disconnect reason.
     DisconnectPeer(PeerId, Option<DisconnectReason>),
-    /// Add a new listener for [`NetworkEvent`].
-    EventListener(UnboundedSender<NetworkEvent>),
-    /// Broadcast event to announce a new block to all nodes.
+    /// Broadcasts an event to announce a new block to all nodes.
     AnnounceBlock(NewBlock, B256),
-    /// Sends the list of transactions to the given peer.
-    SendTransaction { peer_id: PeerId, msg: SharedTransactions },
-    /// Sends the list of transactions hashes to the given peer.
-    SendPooledTransactionHashes { peer_id: PeerId, msg: NewPooledTransactionHashes },
-    /// Send an `eth` protocol request to the peer.
+    /// Sends a list of transactions to the given peer.
+    SendTransaction {
+        /// The ID of the peer to which the transactions are sent.
+        peer_id: PeerId,
+        /// The shared transactions to send.
+        msg: SharedTransactions,
+    },
+    /// Sends a list of transaction hashes to the given peer.
+    SendPooledTransactionHashes {
+        /// The ID of the peer to which the transaction hashes are sent.
+        peer_id: PeerId,
+        /// The new pooled transaction hashes to send.
+        msg: NewPooledTransactionHashes,
+    },
+    /// Sends an `eth` protocol request to the peer.
     EthRequest {
         /// The peer to send the request to.
         peer_id: PeerId,
         /// The request to send to the peer's sessions.
         request: PeerRequest,
     },
-    /// Apply a reputation change to the given peer.
+    /// Applies a reputation change to the given peer.
     ReputationChange(PeerId, ReputationChangeKind),
     /// Returns the client that can be used to interact with the network.
     FetchClient(oneshot::Sender<FetchClient>),
-    /// Apply a status update.
-    StatusUpdate { head: Head },
-    /// Get the current status
+    /// Applies a status update.
+    StatusUpdate {
+        /// The head status to apply.
+        head: Head,
+    },
+    /// Retrieves the current status via a oneshot sender.
     GetStatus(oneshot::Sender<NetworkStatus>),
-    /// Get PeerInfo for the given peerids
+    /// Gets `PeerInfo` for the specified peer IDs.
     GetPeerInfosByIds(Vec<PeerId>, oneshot::Sender<Vec<PeerInfo>>),
-    /// Get PeerInfo from all the peers
+    /// Gets `PeerInfo` from all the peers via a oneshot sender.
     GetPeerInfos(oneshot::Sender<Vec<PeerInfo>>),
-    /// Get PeerInfo for a specific peer
+    /// Gets `PeerInfo` for a specific peer via a oneshot sender.
     GetPeerInfoById(PeerId, oneshot::Sender<Option<PeerInfo>>),
-    /// Get PeerInfo for a specific peer
+    /// Gets `PeerInfo` for a specific peer kind via a oneshot sender.
     GetPeerInfosByPeerKind(PeerKind, oneshot::Sender<Vec<PeerInfo>>),
-    /// Get the reputation for a specific peer
+    /// Gets the reputation for a specific peer via a oneshot sender.
     GetReputationById(PeerId, oneshot::Sender<Option<Reputation>>),
-    /// Gracefully shutdown network
+    /// Retrieves the `TransactionsHandle` via a oneshot sender.
+    GetTransactionsHandle(oneshot::Sender<Option<TransactionsHandle>>),
+    /// Initiates a graceful shutdown of the network via a oneshot sender.
     Shutdown(oneshot::Sender<()>),
-    /// Add a new listener for `DiscoveryEvent`.
+    /// Sets the network state between hibernation and active.
+    SetNetworkState(NetworkConnectionState),
+    /// Adds a new listener for `DiscoveryEvent`.
     DiscoveryListener(UnboundedSender<DiscoveryEvent>),
-    /// Add an additional [RlpxSubProtocol].
+    /// Adds an additional `RlpxSubProtocol`.
     AddRlpxSubProtocol(RlpxSubProtocol),
+    /// Connect to the given peer.
+    ConnectPeer(PeerId, PeerKind, PeerAddr),
     /// Send consensus message to peer
     SendConsensus { peer_id: PeerId, msg: ClayerConsensusMsg },
 }

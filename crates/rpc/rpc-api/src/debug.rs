@@ -1,11 +1,13 @@
+use alloy_eips::{BlockId, BlockNumberOrTag};
+use alloy_primitives::{Address, Bytes, B256};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-use reth_primitives::{Address, BlockId, BlockNumberOrTag, Bytes, B256};
 use reth_rpc_types::{
+    debug::ExecutionWitness,
     trace::geth::{
         BlockTraceResult, GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace,
         TraceResult,
     },
-    Bundle, CallRequest, RichBlock, StateContext,
+    Block, Bundle, StateContext, TransactionRequest,
 };
 
 /// Debug rpc interface.
@@ -21,10 +23,12 @@ pub trait DebugApi {
     async fn raw_block(&self, block_id: BlockId) -> RpcResult<Bytes>;
 
     /// Returns a EIP-2718 binary-encoded transaction.
+    ///
+    /// If this is a pooled EIP-4844 transaction, the blob sidecar is included.
     #[method(name = "getRawTransaction")]
-    async fn raw_transaction(&self, hash: B256) -> RpcResult<Bytes>;
+    async fn raw_transaction(&self, hash: B256) -> RpcResult<Option<Bytes>>;
 
-    /// Returns an array of EIP-2718 binary-encoded transactions for the given [BlockId].
+    /// Returns an array of EIP-2718 binary-encoded transactions for the given [`BlockId`].
     #[method(name = "getRawTransactions")]
     async fn raw_transactions(&self, block_id: BlockId) -> RpcResult<Vec<Bytes>>;
 
@@ -34,7 +38,7 @@ pub trait DebugApi {
 
     /// Returns an array of recent bad blocks that the client has seen on the network.
     #[method(name = "getBadBlocks")]
-    async fn bad_blocks(&self) -> RpcResult<Vec<RichBlock>>;
+    async fn bad_blocks(&self) -> RpcResult<Vec<Block>>;
 
     /// Returns the structured logs created during the execution of EVM between two blocks
     /// (excluding start) as a JSON object.
@@ -102,8 +106,8 @@ pub trait DebugApi {
     #[method(name = "traceCall")]
     async fn debug_trace_call(
         &self,
-        request: CallRequest,
-        block_number: Option<BlockId>,
+        request: TransactionRequest,
+        block_id: Option<BlockId>,
         opts: Option<GethDebugTracingCallOptions>,
     ) -> RpcResult<GethTrace>;
 
@@ -130,8 +134,22 @@ pub trait DebugApi {
         opts: Option<GethDebugTracingCallOptions>,
     ) -> RpcResult<Vec<Vec<GethTrace>>>;
 
+    /// The `debug_executionWitness` method allows for re-execution of a block with the purpose of
+    /// generating an execution witness. The witness comprises of a map of all hashed trie nodes
+    /// to their preimages that were required during the execution of the block, including during
+    /// state root recomputation.
+    ///
+    /// The first argument is the block number or block hash. The second argument is a boolean
+    /// indicating whether to include the preimages of keys in the response.
+    #[method(name = "executionWitness")]
+    async fn debug_execution_witness(
+        &self,
+        block: BlockNumberOrTag,
+        include_preimages: bool,
+    ) -> RpcResult<ExecutionWitness>;
+
     /// Sets the logging backtrace location. When a backtrace location is set and a log message is
-    /// emitted at that location,  the stack of the goroutine executing the log statement will
+    /// emitted at that location, the stack of the goroutine executing the log statement will
     /// be printed to stderr.
     #[method(name = "backtraceAt")]
     async fn debug_backtrace_at(&self, location: &str) -> RpcResult<()>;

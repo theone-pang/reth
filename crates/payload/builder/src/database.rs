@@ -1,19 +1,15 @@
 //! Database adapters for payload building.
-
-use reth_primitives::{
-    revm_primitives::{
-        db::{Database, DatabaseRef},
-        AccountInfo, Address, Bytecode, B256,
-    },
-    U256,
+use alloy_primitives::{Address, B256, U256};
+use reth_primitives::revm_primitives::{
+    db::{Database, DatabaseRef},
+    AccountInfo, Bytecode,
 };
-
 use std::{
     cell::RefCell,
     collections::{hash_map::Entry, HashMap},
 };
 
-/// A container type that caches reads from an underlying [DatabaseRef].
+/// A container type that caches reads from an underlying [`DatabaseRef`].
 ///
 /// This is intended to be used in conjunction with `revm::db::State`
 /// during payload building which repeatedly accesses the same data.
@@ -36,13 +32,13 @@ use std::{
 pub struct CachedReads {
     accounts: HashMap<Address, CachedAccount>,
     contracts: HashMap<B256, Bytecode>,
-    block_hashes: HashMap<U256, B256>,
+    block_hashes: HashMap<u64, B256>,
 }
 
 // === impl CachedReads ===
 
 impl CachedReads {
-    /// Gets a [DatabaseRef] that will cache reads from the given database.
+    /// Gets a [`DatabaseRef`] that will cache reads from the given database.
     pub fn as_db<DB>(&mut self, db: DB) -> CachedReadsDBRef<'_, DB> {
         CachedReadsDBRef { inner: RefCell::new(self.as_db_mut(db)) }
     }
@@ -50,12 +46,25 @@ impl CachedReads {
     fn as_db_mut<DB>(&mut self, db: DB) -> CachedReadsDbMut<'_, DB> {
         CachedReadsDbMut { cached: self, db }
     }
+
+    /// Inserts an account info into the cache.
+    pub fn insert_account(
+        &mut self,
+        address: Address,
+        info: AccountInfo,
+        storage: HashMap<U256, U256>,
+    ) {
+        self.accounts.insert(address, CachedAccount { info: Some(info), storage });
+    }
 }
 
+/// A [Database] that caches reads inside [`CachedReads`].
 #[derive(Debug)]
-struct CachedReadsDbMut<'a, DB> {
-    cached: &'a mut CachedReads,
-    db: DB,
+pub struct CachedReadsDbMut<'a, DB> {
+    /// The cache of reads.
+    pub cached: &'a mut CachedReads,
+    /// The underlying database.
+    pub db: DB,
 }
 
 impl<'a, DB: DatabaseRef> Database for CachedReadsDbMut<'a, DB> {
@@ -81,17 +90,10 @@ impl<'a, DB: DatabaseRef> Database for CachedReadsDbMut<'a, DB> {
 
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         match self.cached.accounts.entry(address) {
-            Entry::Occupied(mut acc_entry) => {
-                let acc_entry = acc_entry.get_mut();
-                match acc_entry.storage.entry(index) {
-                    Entry::Occupied(entry) => Ok(*entry.get()),
-                    Entry::Vacant(entry) => {
-                        let slot = self.db.storage_ref(address, index)?;
-                        entry.insert(slot);
-                        Ok(slot)
-                    }
-                }
-            }
+            Entry::Occupied(mut acc_entry) => match acc_entry.get_mut().storage.entry(index) {
+                Entry::Occupied(entry) => Ok(*entry.get()),
+                Entry::Vacant(entry) => Ok(*entry.insert(self.db.storage_ref(address, index)?)),
+            },
             Entry::Vacant(acc_entry) => {
                 // acc needs to be loaded for us to access slots.
                 let info = self.db.basic_ref(address)?;
@@ -109,7 +111,7 @@ impl<'a, DB: DatabaseRef> Database for CachedReadsDbMut<'a, DB> {
         }
     }
 
-    fn block_hash(&mut self, number: U256) -> Result<B256, Self::Error> {
+    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
         let code = match self.cached.block_hashes.entry(number) {
             Entry::Occupied(entry) => *entry.get(),
             Entry::Vacant(entry) => *entry.insert(self.db.block_hash_ref(number)?),
@@ -118,13 +120,14 @@ impl<'a, DB: DatabaseRef> Database for CachedReadsDbMut<'a, DB> {
     }
 }
 
-/// A [DatabaseRef] that caches reads inside [CachedReads].
+/// A [`DatabaseRef`] that caches reads inside [`CachedReads`].
 ///
-/// This is intended to be used as the [DatabaseRef] for
+/// This is intended to be used as the [`DatabaseRef`] for
 /// `revm::db::State` for repeated payload build jobs.
 #[derive(Debug)]
 pub struct CachedReadsDBRef<'a, DB> {
-    inner: RefCell<CachedReadsDbMut<'a, DB>>,
+    /// The inner cache reads db mut.
+    pub inner: RefCell<CachedReadsDbMut<'a, DB>>,
 }
 
 impl<'a, DB: DatabaseRef> DatabaseRef for CachedReadsDBRef<'a, DB> {
@@ -142,7 +145,7 @@ impl<'a, DB: DatabaseRef> DatabaseRef for CachedReadsDBRef<'a, DB> {
         self.inner.borrow_mut().storage(address, index)
     }
 
-    fn block_hash_ref(&self, number: U256) -> Result<B256, Self::Error> {
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
         self.inner.borrow_mut().block_hash(number)
     }
 }

@@ -1,11 +1,13 @@
 use crate::{
     identifier::{SenderId, TransactionId},
     pool::size::SizeTracker,
-    PoolTransaction, SubPoolLimit, ValidPoolTransaction,
+    PoolTransaction, SubPoolLimit, ValidPoolTransaction, TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
 };
+use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, BinaryHeap},
+    collections::{hash_map::Entry, BTreeMap, BTreeSet},
     ops::{Bound::Unbounded, Deref},
     sync::Arc,
 };
@@ -17,10 +19,9 @@ use std::{
 /// This pool is a bijection: at all times each set (`best`, `by_id`) contains the same
 /// transactions.
 ///
-/// Note: This type is generic over [ParkedPool] which enforces that the underlying transaction type
-/// is [ValidPoolTransaction] wrapped in an [Arc].
-#[allow(missing_debug_implementations)]
-#[derive(Clone)]
+/// Note: This type is generic over [`ParkedPool`] which enforces that the underlying transaction
+/// type is [`ValidPoolTransaction`] wrapped in an [Arc].
+#[derive(Debug, Clone)]
 pub struct ParkedPool<T: ParkedOrd> {
     /// Keeps track of transactions inserted in the pool.
     ///
@@ -32,6 +33,14 @@ pub struct ParkedPool<T: ParkedOrd> {
     ///
     /// The higher, the better.
     best: BTreeSet<ParkedPoolTransaction<T>>,
+    /// Keeps track of last submission id for each sender.
+    ///
+    /// This are sorted in Reverse order, so the last (highest) submission id is first, and the
+    /// lowest(oldest) is the last.
+    last_sender_submission: BTreeSet<SubmissionSenderId>,
+    /// Keeps track of the number of transactions in the pool by the sender and the last submission
+    /// id.
+    sender_transaction_count: FxHashMap<SenderId, SenderTransactionCount>,
     /// Keeps track of the size of this pool.
     ///
     /// See also [`PoolTransaction::size`].
@@ -59,10 +68,64 @@ impl<T: ParkedOrd> ParkedPool<T> {
         self.size_of += tx.size();
 
         // update or create sender entry
+        self.add_sender_count(tx.sender_id(), submission_id);
         let transaction = ParkedPoolTransaction { submission_id, transaction: tx.into() };
 
         self.by_id.insert(id, transaction.clone());
         self.best.insert(transaction);
+    }
+
+    /// Increments the count of transactions for the given sender and updates the tracked submission
+    /// id.
+    fn add_sender_count(&mut self, sender: SenderId, submission_id: u64) {
+        match self.sender_transaction_count.entry(sender) {
+            Entry::Occupied(mut entry) => {
+                let value = entry.get_mut();
+                // remove the __currently__ tracked submission id
+                self.last_sender_submission
+                    .remove(&SubmissionSenderId::new(sender, value.last_submission_id));
+
+                value.count += 1;
+                value.last_submission_id = submission_id;
+            }
+            Entry::Vacant(entry) => {
+                entry
+                    .insert(SenderTransactionCount { count: 1, last_submission_id: submission_id });
+            }
+        }
+        // insert a new entry
+        self.last_sender_submission.insert(SubmissionSenderId::new(sender, submission_id));
+    }
+
+    /// Decrements the count of transactions for the given sender.
+    ///
+    /// If the count reaches zero, the sender is removed from the map.
+    ///
+    /// Note: this does not update the tracked submission id for the sender, because we're only
+    /// interested in the __last__ submission id when truncating the pool.
+    fn remove_sender_count(&mut self, sender_id: SenderId) {
+        let removed_sender = match self.sender_transaction_count.entry(sender_id) {
+            Entry::Occupied(mut entry) => {
+                let value = entry.get_mut();
+                value.count -= 1;
+                if value.count == 0 {
+                    entry.remove()
+                } else {
+                    return
+                }
+            }
+            Entry::Vacant(_) => {
+                // This should never happen because the bisection between the two maps
+                unreachable!("sender count not found {:?}", sender_id);
+            }
+        };
+
+        // all transactions for this sender have been removed
+        assert!(
+            self.last_sender_submission
+                .remove(&SubmissionSenderId::new(sender_id, removed_sender.last_submission_id)),
+            "last sender transaction not found {sender_id:?}"
+        );
     }
 
     /// Returns an iterator over all transactions in the pool
@@ -80,6 +143,7 @@ impl<T: ParkedOrd> ParkedPool<T> {
         // remove from queues
         let tx = self.by_id.remove(id)?;
         self.best.remove(&tx);
+        self.remove_sender_count(tx.transaction.sender_id());
 
         // keep track of size
         self.size_of -= tx.transaction.size();
@@ -87,60 +151,34 @@ impl<T: ParkedOrd> ParkedPool<T> {
         Some(tx.transaction.into())
     }
 
-    /// Get transactions by sender
-    pub(crate) fn get_txs_by_sender(&self, sender: SenderId) -> Vec<TransactionId> {
+    /// Retrieves transactions by sender, using `SmallVec` to efficiently handle up to
+    /// `TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER` transactions.
+    pub(crate) fn get_txs_by_sender(
+        &self,
+        sender: SenderId,
+    ) -> SmallVec<[TransactionId; TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER]> {
         self.by_id
             .range((sender.start_bound(), Unbounded))
             .take_while(move |(other, _)| sender == other.sender)
-            .map(|(_, tx)| *tx.transaction.id())
+            .map(|(tx_id, _)| *tx_id)
             .collect()
     }
 
-    /// Returns sender ids sorted by each sender's last submission id. Senders with older last
+    #[cfg(test)]
+    pub(crate) fn get_senders_by_submission_id(
+        &self,
+    ) -> impl Iterator<Item = SubmissionSenderId> + '_ {
+        self.last_sender_submission.iter().copied()
+    }
+
+    /// Truncates the pool by removing transactions, until the given [`SubPoolLimit`] has been met.
+    ///
+    /// This is done by first ordering senders by the last time they have submitted a transaction
+    ///
+    /// Uses sender ids sorted by each sender's last submission id. Senders with older last
     /// submission ids are first. Note that _last_ submission ids are the newest submission id for
     /// that sender, so this sorts senders by the last time they submitted a transaction in
     /// descending order. Senders that have least recently submitted a transaction are first.
-    ///
-    /// Similar to `Heartbeat` in Geth
-    pub fn get_senders_by_submission_id(&self) -> Vec<SubmissionSenderId> {
-        // iterate through by_id, and get the last submission id for each sender
-        let senders = self
-            .by_id
-            .iter()
-            .fold(Vec::new(), |mut set: Vec<SubmissionSenderId>, (_, tx)| {
-                if let Some(last) = set.last_mut() {
-                    // sort by last
-                    if last.sender_id == tx.transaction.sender_id() {
-                        if last.submission_id < tx.submission_id {
-                            // update last submission id
-                            last.submission_id = tx.submission_id;
-                        }
-                    } else {
-                        // new entry
-                        set.push(SubmissionSenderId::new(
-                            tx.transaction.sender_id(),
-                            tx.submission_id,
-                        ));
-                    }
-                } else {
-                    // first entry
-                    set.push(SubmissionSenderId::new(tx.transaction.sender_id(), tx.submission_id));
-                }
-                set
-            })
-            .into_iter()
-            // sort by submission id
-            .collect::<BinaryHeap<_>>();
-
-        // sort s.t. senders with older submission ids are first
-        senders.into_sorted_vec()
-    }
-
-    /// Truncates the pool by removing transactions, until the given [SubPoolLimit] has been met.
-    ///
-    /// This is done by first ordering senders by the last time they have submitted a transaction,
-    /// using [get_senders_by_submission_id](ParkedPool::get_senders_by_submission_id) to determine
-    /// this ordering.
     ///
     /// Then, for each sender, all transactions for that sender are removed, until the pool limits
     /// have been met.
@@ -150,39 +188,28 @@ impl<T: ParkedOrd> ParkedPool<T> {
         &mut self,
         limit: SubPoolLimit,
     ) -> Vec<Arc<ValidPoolTransaction<T::Transaction>>> {
-        if self.len() <= limit.max_txs {
+        if !self.exceeds(&limit) {
             // if we are below the limits, we don't need to drop anything
             return Vec::new()
         }
 
         let mut removed = Vec::new();
-        let mut sender_ids = self.get_senders_by_submission_id();
-        let queued = self.len();
-        let mut drop = queued - limit.max_txs;
 
-        while drop > 0 && !sender_ids.is_empty() {
-            // SAFETY: This will not panic due to `!addresses.is_empty()`
-            let sender_id = sender_ids.pop().unwrap().sender_id;
-            let mut list = self.get_txs_by_sender(sender_id);
+        while limit.is_exceeded(self.len(), self.size()) && !self.last_sender_submission.is_empty()
+        {
+            // NOTE: This will not panic due to `!last_sender_transaction.is_empty()`
+            let sender_id = self.last_sender_submission.last().expect("not empty").sender_id;
+            let list = self.get_txs_by_sender(sender_id);
 
-            // Drop all transactions if they are less than the overflow
-            if list.len() <= drop {
-                for txid in &list {
-                    if let Some(tx) = self.remove_transaction(txid) {
-                        removed.push(tx);
-                    }
-                }
-                drop -= list.len();
-                continue
-            }
-
-            // Otherwise drop only last few transactions
-            // SAFETY: This will not panic because `list.len() > drop`
-            for txid in list.split_off(drop) {
+            // Drop transactions from this sender until the pool is under limits
+            for txid in list.into_iter().rev() {
                 if let Some(tx) = self.remove_transaction(&txid) {
                     removed.push(tx);
                 }
-                drop -= 1;
+
+                if !self.exceeds(&limit) {
+                    break
+                }
             }
         }
 
@@ -205,9 +232,15 @@ impl<T: ParkedOrd> ParkedPool<T> {
         self.by_id.len()
     }
 
+    /// Returns true if the pool exceeds the given limit
+    #[inline]
+    pub(crate) fn exceeds(&self, limit: &SubPoolLimit) -> bool {
+        limit.is_exceeded(self.len(), self.size())
+    }
+
     /// Returns whether the pool is empty
     #[cfg(test)]
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.by_id.is_empty()
     }
@@ -226,6 +259,12 @@ impl<T: ParkedOrd> ParkedPool<T> {
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn assert_invariants(&self) {
         assert_eq!(self.by_id.len(), self.best.len(), "by_id.len() != best.len()");
+
+        assert_eq!(
+            self.last_sender_submission.len(),
+            self.sender_transaction_count.len(),
+            "last_sender_transaction.len() != sender_to_last_transaction.len()"
+        );
     }
 }
 
@@ -233,6 +272,7 @@ impl<T: PoolTransaction> ParkedPool<BasefeeOrd<T>> {
     /// Returns all transactions that satisfy the given basefee.
     ///
     /// Note: this does _not_ remove the transactions
+    #[allow(dead_code)]
     pub(crate) fn satisfy_base_fee_transactions(
         &self,
         basefee: u64,
@@ -290,12 +330,22 @@ impl<T: ParkedOrd> Default for ParkedPool<T> {
             submission_id: 0,
             by_id: Default::default(),
             best: Default::default(),
+            last_sender_submission: Default::default(),
+            sender_transaction_count: Default::default(),
             size_of: Default::default(),
         }
     }
 }
 
+/// Keeps track of the number of transactions and the latest submission id for each sender.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SenderTransactionCount {
+    count: u64,
+    last_submission_id: u64,
+}
+
 /// Represents a transaction in this pool.
+#[derive(Debug)]
 struct ParkedPoolTransaction<T: ParkedOrd> {
     /// Identifier that tags when transaction was submitted in the pool.
     submission_id: u64,
@@ -334,10 +384,10 @@ impl<T: ParkedOrd> Ord for ParkedPoolTransaction<T> {
     }
 }
 
-/// Includes a [SenderId] and `submission_id`. This is used to sort senders by their last
+/// Includes a [`SenderId`] and `submission_id`. This is used to sort senders by their last
 /// submission id.
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct SubmissionSenderId {
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct SubmissionSenderId {
     /// The sender id
     pub(crate) sender_id: SenderId,
     /// The submission id
@@ -345,8 +395,8 @@ pub struct SubmissionSenderId {
 }
 
 impl SubmissionSenderId {
-    /// Creates a new [SubmissionSenderId] based on the [SenderId] and `submission_id`.
-    fn new(sender_id: SenderId, submission_id: u64) -> Self {
+    /// Creates a new [`SubmissionSenderId`] based on the [`SenderId`] and `submission_id`.
+    const fn new(sender_id: SenderId, submission_id: u64) -> Self {
         Self { sender_id, submission_id }
     }
 }
@@ -452,7 +502,7 @@ impl<T: PoolTransaction> Ord for BasefeeOrd<T> {
 /// The primary order function always compares the transaction costs first. In case these
 /// are equal, it compares the timestamps when the transactions were created.
 #[derive(Debug)]
-pub(crate) struct QueuedOrd<T: PoolTransaction>(Arc<ValidPoolTransaction<T>>);
+pub struct QueuedOrd<T: PoolTransaction>(Arc<ValidPoolTransaction<T>>);
 
 impl_ord_wrapper!(QueuedOrd);
 
@@ -470,7 +520,8 @@ impl<T: PoolTransaction> Ord for QueuedOrd<T> {
 mod tests {
     use super::*;
     use crate::test_utils::{MockTransaction, MockTransactionFactory, MockTransactionSet};
-    use reth_primitives::{address, TxType};
+    use alloy_primitives::address;
+    use reth_primitives::TxType;
     use std::collections::HashSet;
 
     #[test]
@@ -540,17 +591,17 @@ mod tests {
         let d_sender = address!("000000000000000000000000000000000000000d");
 
         // create a chain of transactions by sender A, B, C
-        let mut tx_set = MockTransactionSet::dependent(a_sender, 0, 4, TxType::EIP1559);
+        let mut tx_set = MockTransactionSet::dependent(a_sender, 0, 4, TxType::Eip1559);
         let a = tx_set.clone().into_vec();
 
-        let b = MockTransactionSet::dependent(b_sender, 0, 3, TxType::EIP1559).into_vec();
+        let b = MockTransactionSet::dependent(b_sender, 0, 3, TxType::Eip1559).into_vec();
         tx_set.extend(b.clone());
 
         // C has the same number of txs as B
-        let c = MockTransactionSet::dependent(c_sender, 0, 3, TxType::EIP1559).into_vec();
+        let c = MockTransactionSet::dependent(c_sender, 0, 3, TxType::Eip1559).into_vec();
         tx_set.extend(c.clone());
 
-        let d = MockTransactionSet::dependent(d_sender, 0, 1, TxType::EIP1559).into_vec();
+        let d = MockTransactionSet::dependent(d_sender, 0, 1, TxType::Eip1559).into_vec();
         tx_set.extend(d.clone());
 
         let all_txs = tx_set.into_vec();
@@ -604,6 +655,35 @@ mod tests {
     }
 
     #[test]
+    fn test_truncate_parked_with_large_tx() {
+        let mut f = MockTransactionFactory::default();
+        let mut pool = ParkedPool::<BasefeeOrd<_>>::default();
+        let default_limits = SubPoolLimit::default();
+
+        // create a chain of transactions by sender A
+        // make sure they are all one over half the limit
+        let a_sender = address!("000000000000000000000000000000000000000a");
+
+        // 2 txs, that should put the pool over the size limit but not max txs
+        let a_txs = MockTransactionSet::dependent(a_sender, 0, 2, TxType::Eip1559)
+            .into_iter()
+            .map(|mut tx| {
+                tx.set_size(default_limits.max_size / 2 + 1);
+                tx
+            })
+            .collect::<Vec<_>>();
+
+        // add all the transactions to the pool
+        for tx in a_txs {
+            pool.add_transaction(f.validated_arc(tx));
+        }
+
+        // truncate the pool, it should remove at least one transaction
+        let removed = pool.truncate_pool(default_limits);
+        assert_eq!(removed.len(), 1);
+    }
+
+    #[test]
     fn test_senders_by_submission_id() {
         // this test ensures that we evict from the pending pool by sender
         let mut f = MockTransactionFactory::default();
@@ -616,19 +696,19 @@ mod tests {
 
         // create a chain of transactions by sender A, B, C
         let mut tx_set =
-            MockTransactionSet::dependent(a_sender, 0, 4, reth_primitives::TxType::EIP1559);
+            MockTransactionSet::dependent(a_sender, 0, 4, reth_primitives::TxType::Eip1559);
         let a = tx_set.clone().into_vec();
 
-        let b = MockTransactionSet::dependent(b_sender, 0, 3, reth_primitives::TxType::EIP1559)
+        let b = MockTransactionSet::dependent(b_sender, 0, 3, reth_primitives::TxType::Eip1559)
             .into_vec();
         tx_set.extend(b.clone());
 
         // C has the same number of txs as B
-        let c = MockTransactionSet::dependent(c_sender, 0, 3, reth_primitives::TxType::EIP1559)
+        let c = MockTransactionSet::dependent(c_sender, 0, 3, reth_primitives::TxType::Eip1559)
             .into_vec();
         tx_set.extend(c.clone());
 
-        let d = MockTransactionSet::dependent(d_sender, 0, 1, reth_primitives::TxType::EIP1559)
+        let d = MockTransactionSet::dependent(d_sender, 0, 1, reth_primitives::TxType::Eip1559)
             .into_vec();
         tx_set.extend(d.clone());
 
@@ -640,11 +720,7 @@ mod tests {
         }
 
         // get senders by submission id - a4, b3, c3, d1, reversed
-        let senders = pool
-            .get_senders_by_submission_id()
-            .into_iter()
-            .map(|s| s.sender_id)
-            .collect::<Vec<_>>();
+        let senders = pool.get_senders_by_submission_id().map(|s| s.sender_id).collect::<Vec<_>>();
         assert_eq!(senders.len(), 4);
         let expected_senders = vec![d_sender, c_sender, b_sender, a_sender]
             .into_iter()
@@ -661,16 +737,123 @@ mod tests {
             pool.add_transaction(f.validated_arc(tx));
         }
 
-        let senders = pool
-            .get_senders_by_submission_id()
-            .into_iter()
-            .map(|s| s.sender_id)
-            .collect::<Vec<_>>();
+        let senders = pool.get_senders_by_submission_id().map(|s| s.sender_id).collect::<Vec<_>>();
         assert_eq!(senders.len(), 4);
         let expected_senders = vec![a_sender, c_sender, b_sender, d_sender]
             .into_iter()
             .map(|s| f.ids.sender_id(&s).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(senders, expected_senders);
+    }
+
+    #[test]
+    fn test_add_sender_count_new_sender() {
+        // Initialize a mock transaction factory
+        let mut f = MockTransactionFactory::default();
+        // Create an empty transaction pool
+        let mut pool = ParkedPool::<BasefeeOrd<_>>::default();
+        // Generate a validated transaction and add it to the pool
+        let tx = f.validated_arc(MockTransaction::eip1559().inc_price());
+        pool.add_transaction(tx);
+
+        // Define a new sender ID and submission ID
+        let sender: SenderId = 11.into();
+        let submission_id = 1;
+
+        // Add the sender count to the pool
+        pool.add_sender_count(sender, submission_id);
+
+        // Assert that the sender transaction count is updated correctly
+        assert_eq!(pool.sender_transaction_count.len(), 2);
+        let sender_info = pool.sender_transaction_count.get(&sender).unwrap();
+        assert_eq!(sender_info.count, 1);
+        assert_eq!(sender_info.last_submission_id, submission_id);
+
+        // Assert that the last sender submission is updated correctly
+        assert_eq!(pool.last_sender_submission.len(), 2);
+        let submission_info = pool.last_sender_submission.iter().next().unwrap();
+        assert_eq!(submission_info.sender_id, sender);
+        assert_eq!(submission_info.submission_id, submission_id);
+    }
+
+    #[test]
+    fn test_add_sender_count_existing_sender() {
+        // Initialize a mock transaction factory
+        let mut f = MockTransactionFactory::default();
+        // Create an empty transaction pool
+        let mut pool = ParkedPool::<BasefeeOrd<_>>::default();
+        // Generate a validated transaction and add it to the pool
+        let tx = f.validated_arc(MockTransaction::eip1559().inc_price());
+        pool.add_transaction(tx);
+
+        // Define a sender ID and initial submission ID
+        let sender: SenderId = 11.into();
+        let initial_submission_id = 1;
+
+        // Add the sender count to the pool with the initial submission ID
+        pool.add_sender_count(sender, initial_submission_id);
+
+        // Define a new submission ID
+        let new_submission_id = 2;
+        // Add the sender count to the pool with the new submission ID
+        pool.add_sender_count(sender, new_submission_id);
+
+        // Assert that the sender transaction count is updated correctly
+        assert_eq!(pool.sender_transaction_count.len(), 2);
+        let sender_info = pool.sender_transaction_count.get(&sender).unwrap();
+        assert_eq!(sender_info.count, 2);
+        assert_eq!(sender_info.last_submission_id, new_submission_id);
+
+        // Assert that the last sender submission is updated correctly
+        assert_eq!(pool.last_sender_submission.len(), 2);
+        let submission_info = pool.last_sender_submission.iter().next().unwrap();
+        assert_eq!(submission_info.sender_id, sender);
+        assert_eq!(submission_info.submission_id, new_submission_id);
+    }
+
+    #[test]
+    fn test_add_sender_count_multiple_senders() {
+        // Initialize a mock transaction factory
+        let mut f = MockTransactionFactory::default();
+        // Create an empty transaction pool
+        let mut pool = ParkedPool::<BasefeeOrd<_>>::default();
+        // Generate two validated transactions and add them to the pool
+        let tx1 = f.validated_arc(MockTransaction::eip1559().inc_price());
+        let tx2 = f.validated_arc(MockTransaction::eip1559().inc_price());
+        pool.add_transaction(tx1);
+        pool.add_transaction(tx2);
+
+        // Define two different sender IDs and their corresponding submission IDs
+        let sender1: SenderId = 11.into();
+        let sender2: SenderId = 22.into();
+
+        // Add the sender counts to the pool
+        pool.add_sender_count(sender1, 1);
+        pool.add_sender_count(sender2, 2);
+
+        // Assert that the sender transaction counts are updated correctly
+        assert_eq!(pool.sender_transaction_count.len(), 4);
+
+        let sender1_info = pool.sender_transaction_count.get(&sender1).unwrap();
+        assert_eq!(sender1_info.count, 1);
+        assert_eq!(sender1_info.last_submission_id, 1);
+
+        let sender2_info = pool.sender_transaction_count.get(&sender2).unwrap();
+        assert_eq!(sender2_info.count, 1);
+        assert_eq!(sender2_info.last_submission_id, 2);
+
+        // Assert that the last sender submission is updated correctly
+        assert_eq!(pool.last_sender_submission.len(), 3);
+
+        // Verify that sender 1 is not in the last sender submission
+        let submission_info1 =
+            pool.last_sender_submission.iter().find(|info| info.sender_id == sender1);
+        assert!(submission_info1.is_none());
+
+        // Verify that sender 2 is in the last sender submission
+        let submission_info2 =
+            pool.last_sender_submission.iter().find(|info| info.sender_id == sender2).unwrap();
+        assert_eq!(submission_info2.sender_id, sender2);
+        assert_eq!(submission_info2.submission_id, 2);
     }
 }

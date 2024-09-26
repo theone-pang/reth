@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 #![cfg(feature = "ef-tests")]
 
 use ef_tests::{cases::blockchain_test::BlockchainTests, suite::Suite};
@@ -6,22 +7,12 @@ macro_rules! general_state_test {
     ($test_name:ident, $dir:ident) => {
         #[test]
         fn $test_name() {
-            // TODO: can be removed with revm call-loop support
-            // <https://github.com/paradigmxyz/reth/issues/5582>
-            std::thread::Builder::new()
-                .stack_size(
-                    1024 * 1024 * 8, // 8MB
-                )
-                .spawn(move || {
-                    BlockchainTests::new(format!("GeneralStateTests/{}", stringify!($dir))).run();
-                })
-                .unwrap()
-                .join()
-                .unwrap();
+            BlockchainTests::new(format!("GeneralStateTests/{}", stringify!($dir))).run();
         }
     };
 }
 
+#[allow(missing_docs)]
 mod general_state_tests {
     use super::*;
 

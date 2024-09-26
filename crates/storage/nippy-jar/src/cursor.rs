@@ -1,10 +1,8 @@
 use crate::{
     compression::{Compression, Compressors, Zstd},
-    DataReader, InclusionFilter, NippyJar, NippyJarError, NippyJarHeader, PerfectHashingFunction,
-    RefRow,
+    DataReader, NippyJar, NippyJarError, NippyJarHeader, RefRow,
 };
 use std::{ops::Range, sync::Arc};
-use sucds::int_vectors::Access;
 use zstd::bulk::Decompressor;
 
 /// Simple cursor implementation to retrieve data from [`NippyJar`].
@@ -53,47 +51,18 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
     }
 
     /// Returns a reference to the related [`NippyJar`]
-    pub fn jar(&self) -> &NippyJar<H> {
+    pub const fn jar(&self) -> &NippyJar<H> {
         self.jar
     }
 
     /// Returns current row index of the cursor
-    pub fn row_index(&self) -> u64 {
+    pub const fn row_index(&self) -> u64 {
         self.row
     }
 
     /// Resets cursor to the beginning.
     pub fn reset(&mut self) {
         self.row = 0;
-    }
-
-    /// Returns a row, searching it by a key used during [`NippyJar::prepare_index`].
-    ///
-    /// **May return false positives.**
-    ///
-    /// Example usage would be querying a transactions file with a transaction hash which is **NOT**
-    /// stored in file.
-    pub fn row_by_key(&mut self, key: &[u8]) -> Result<Option<RefRow<'_>>, NippyJarError> {
-        if let (Some(filter), Some(phf)) = (&self.jar.filter, &self.jar.phf) {
-            // TODO: is it worth to parallize both?
-
-            // May have false positives
-            if filter.contains(key)? {
-                // May have false positives
-                if let Some(row_index) = phf.get_index(key)? {
-                    self.row = self
-                        .jar
-                        .offsets_index
-                        .access(row_index as usize)
-                        .expect("built from same set") as u64;
-                    return self.next_row()
-                }
-            }
-        } else {
-            return Err(NippyJarError::UnsupportedFilterQuery)
-        }
-
-        Ok(None)
     }
 
     /// Returns a row by its number.
@@ -128,40 +97,6 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
                 })
                 .collect(),
         ))
-    }
-
-    /// Returns a row, searching it by a key used during [`NippyJar::prepare_index`]  by using a
-    /// `mask` to only read certain columns from the row.
-    ///
-    /// **May return false positives.**
-    ///
-    /// Example usage would be querying a transactions file with a transaction hash which is **NOT**
-    /// stored in file.
-    pub fn row_by_key_with_cols(
-        &mut self,
-        key: &[u8],
-        mask: usize,
-    ) -> Result<Option<RefRow<'_>>, NippyJarError> {
-        if let (Some(filter), Some(phf)) = (&self.jar.filter, &self.jar.phf) {
-            // TODO: is it worth to parallize both?
-
-            // May have false positives
-            if filter.contains(key)? {
-                // May have false positives
-                if let Some(row_index) = phf.get_index(key)? {
-                    self.row = self
-                        .jar
-                        .offsets_index
-                        .access(row_index as usize)
-                        .expect("built from same set") as u64;
-                    return self.next_row_with_cols(mask)
-                }
-            }
-        } else {
-            return Err(NippyJarError::UnsupportedFilterQuery)
-        }
-
-        Ok(None)
     }
 
     /// Returns a row by its number by using a `mask` to only read certain columns from the row.
@@ -213,13 +148,13 @@ impl<'a, H: NippyJarHeader> NippyJarCursor<'a, H> {
     ) -> Result<(), NippyJarError> {
         // Find out the offset of the column value
         let offset_pos = self.row as usize * self.jar.columns + column;
-        let value_offset = self.reader.offset(offset_pos) as usize;
+        let value_offset = self.reader.offset(offset_pos)? as usize;
 
         let column_offset_range = if self.jar.rows * self.jar.columns == offset_pos + 1 {
             // It's the last column of the last row
             value_offset..self.reader.size()
         } else {
-            let next_value_offset = self.reader.offset(offset_pos + 1) as usize;
+            let next_value_offset = self.reader.offset(offset_pos + 1)? as usize;
             value_offset..next_value_offset
         };
 

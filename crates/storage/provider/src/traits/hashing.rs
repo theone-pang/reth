@@ -1,7 +1,8 @@
+use alloy_primitives::{Address, BlockNumber, B256};
 use auto_impl::auto_impl;
-use reth_db::models::BlockNumberAddress;
-use reth_interfaces::provider::ProviderResult;
-use reth_primitives::{Account, Address, BlockNumber, StorageEntry, B256};
+use reth_db_api::models::BlockNumberAddress;
+use reth_primitives::{Account, StorageEntry};
+use reth_storage_errors::provider::ProviderResult;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ops::{Range, RangeInclusive},
@@ -20,7 +21,7 @@ pub trait HashingWriter: Send + Sync {
         range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<BTreeMap<B256, Option<Account>>>;
 
-    /// Inserts all accounts into [reth_db::tables::AccountHistory] table.
+    /// Inserts all accounts into [reth_db::tables::AccountsHistory] table.
     ///
     /// # Returns
     ///

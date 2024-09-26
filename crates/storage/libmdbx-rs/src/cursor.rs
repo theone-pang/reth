@@ -11,8 +11,7 @@ use ffi::{
     MDBX_NEXT_MULTIPLE, MDBX_NEXT_NODUP, MDBX_PREV, MDBX_PREV_DUP, MDBX_PREV_MULTIPLE,
     MDBX_PREV_NODUP, MDBX_SET, MDBX_SET_KEY, MDBX_SET_LOWERBOUND, MDBX_SET_RANGE,
 };
-use libc::c_void;
-use std::{borrow::Cow, fmt, marker::PhantomData, mem, ptr};
+use std::{borrow::Cow, ffi::c_void, fmt, marker::PhantomData, mem, ptr};
 
 /// A cursor for navigating the items within a database.
 pub struct Cursor<K>
@@ -30,7 +29,9 @@ where
     pub(crate) fn new(txn: Transaction<K>, dbi: ffi::MDBX_dbi) -> Result<Self> {
         let mut cursor: *mut ffi::MDBX_cursor = ptr::null_mut();
         unsafe {
-            mdbx_result(txn.txn_execute(|txn| ffi::mdbx_cursor_open(txn, dbi, &mut cursor)))?;
+            txn.txn_execute(|txn_ptr| {
+                mdbx_result(ffi::mdbx_cursor_open(txn_ptr, dbi, &mut cursor))
+            })??;
         }
         Ok(Self { txn, cursor })
     }
@@ -53,7 +54,7 @@ where
     ///
     /// The caller **must** ensure that the pointer is not used after the
     /// lifetime of the cursor.
-    pub fn cursor(&self) -> *mut ffi::MDBX_cursor {
+    pub const fn cursor(&self) -> *mut ffi::MDBX_cursor {
         self.cursor
     }
 
@@ -100,15 +101,15 @@ where
                 assert_ne!(data_ptr, data_val.iov_base);
                 let key_out = {
                     // MDBX wrote in new key
-                    if key_ptr != key_val.iov_base {
-                        Some(Key::decode_val::<K>(txn, key_val)?)
-                    } else {
+                    if key_ptr == key_val.iov_base {
                         None
+                    } else {
+                        Some(Key::decode_val::<K>(txn, key_val)?)
                     }
                 };
                 let data_out = Value::decode_val::<K>(txn, data_val)?;
                 Ok((key_out, data_out, v))
-            })
+            })?
         }
     }
 
@@ -150,7 +151,7 @@ where
         self.get_full(None, None, MDBX_FIRST)
     }
 
-    /// [DatabaseFlags::DUP_SORT]-only: Position at first data item of current key.
+    /// [`DatabaseFlags::DUP_SORT`]-only: Position at first data item of current key.
     pub fn first_dup<Value>(&mut self) -> Result<Option<Value>>
     where
         Value: TableObject,
@@ -158,7 +159,7 @@ where
         self.get_value(None, None, MDBX_FIRST_DUP)
     }
 
-    /// [DatabaseFlags::DUP_SORT]-only: Position at key/data pair.
+    /// [`DatabaseFlags::DUP_SORT`]-only: Position at key/data pair.
     pub fn get_both<Value>(&mut self, k: &[u8], v: &[u8]) -> Result<Option<Value>>
     where
         Value: TableObject,
@@ -166,7 +167,7 @@ where
         self.get_value(Some(k), Some(v), MDBX_GET_BOTH)
     }
 
-    /// [DatabaseFlags::DUP_SORT]-only: Position at given key and at first data greater than or
+    /// [`DatabaseFlags::DUP_SORT`]-only: Position at given key and at first data greater than or
     /// equal to specified data.
     pub fn get_both_range<Value>(&mut self, k: &[u8], v: &[u8]) -> Result<Option<Value>>
     where
@@ -185,7 +186,7 @@ where
     }
 
     /// DupFixed-only: Return up to a page of duplicate data items from current cursor position.
-    /// Move cursor to prepare for [Self::next_multiple()].
+    /// Move cursor to prepare for [`Self::next_multiple()`].
     pub fn get_multiple<Value>(&mut self) -> Result<Option<Value>>
     where
         Value: TableObject,
@@ -220,7 +221,7 @@ where
         self.get_full(None, None, MDBX_NEXT)
     }
 
-    /// [DatabaseFlags::DUP_SORT]-only: Position at next data item of current key.
+    /// [`DatabaseFlags::DUP_SORT`]-only: Position at next data item of current key.
     pub fn next_dup<Key, Value>(&mut self) -> Result<Option<(Key, Value)>>
     where
         Key: TableObject,
@@ -229,8 +230,8 @@ where
         self.get_full(None, None, MDBX_NEXT_DUP)
     }
 
-    /// [DatabaseFlags::DUP_FIXED]-only: Return up to a page of duplicate data items from next
-    /// cursor position. Move cursor to prepare for MDBX_NEXT_MULTIPLE.
+    /// [`DatabaseFlags::DUP_FIXED`]-only: Return up to a page of duplicate data items from next
+    /// cursor position. Move cursor to prepare for `MDBX_NEXT_MULTIPLE`.
     pub fn next_multiple<Key, Value>(&mut self) -> Result<Option<(Key, Value)>>
     where
         Key: TableObject,
@@ -257,7 +258,7 @@ where
         self.get_full(None, None, MDBX_PREV)
     }
 
-    /// [DatabaseFlags::DUP_SORT]-only: Position at previous data item of current key.
+    /// [`DatabaseFlags::DUP_SORT`]-only: Position at previous data item of current key.
     pub fn prev_dup<Key, Value>(&mut self) -> Result<Option<(Key, Value)>>
     where
         Key: TableObject,
@@ -301,7 +302,7 @@ where
         self.get_full(Some(key), None, MDBX_SET_RANGE)
     }
 
-    /// [DatabaseFlags::DUP_FIXED]-only: Position at previous page and return up to a page of
+    /// [`DatabaseFlags::DUP_FIXED`]-only: Position at previous page and return up to a page of
     /// duplicate data items.
     pub fn prev_multiple<Key, Value>(&mut self) -> Result<Option<(Key, Value)>>
     where
@@ -314,7 +315,7 @@ where
     /// Position at first key-value pair greater than or equal to specified, return both key and
     /// data, and the return code depends on a exact match.
     ///
-    /// For non DupSort-ed collections this works the same as [Self::set_range()], but returns
+    /// For non DupSort-ed collections this works the same as [`Self::set_range()`], but returns
     /// [false] if key found exactly and [true] if greater key was found.
     ///
     /// For DupSort-ed a data value is taken into account for duplicates, i.e. for a pairs/tuples of
@@ -335,7 +336,7 @@ where
     /// The iterator will begin with item next after the cursor, and continue until the end of the
     /// database. For new cursors, the iterator will begin with the first item in the database.
     ///
-    /// For databases with duplicate data items ([DatabaseFlags::DUP_SORT]), the
+    /// For databases with duplicate data items ([`DatabaseFlags::DUP_SORT`]), the
     /// duplicate data items of each key will be returned before moving on to
     /// the next key.
     pub fn iter<Key, Value>(&mut self) -> Iter<'_, K, Key, Value>
@@ -348,7 +349,7 @@ where
 
     /// Iterate over database items starting from the beginning of the database.
     ///
-    /// For databases with duplicate data items ([DatabaseFlags::DUP_SORT]), the
+    /// For databases with duplicate data items ([`DatabaseFlags::DUP_SORT`]), the
     /// duplicate data items of each key will be returned before moving on to
     /// the next key.
     pub fn iter_start<Key, Value>(&mut self) -> Iter<'_, K, Key, Value>
@@ -361,7 +362,7 @@ where
 
     /// Iterate over database items starting from the given key.
     ///
-    /// For databases with duplicate data items ([DatabaseFlags::DUP_SORT]), the
+    /// For databases with duplicate data items ([`DatabaseFlags::DUP_SORT`]), the
     /// duplicate data items of each key will be returned before moving on to
     /// the next key.
     pub fn iter_from<Key, Value>(&mut self, key: &[u8]) -> Iter<'_, K, Key, Value>
@@ -441,7 +442,7 @@ impl Cursor<RW> {
         mdbx_result(unsafe {
             self.txn.txn_execute(|_| {
                 ffi::mdbx_cursor_put(self.cursor, &key_val, &mut data_val, flags.bits())
-            })
+            })?
         })?;
 
         Ok(())
@@ -451,11 +452,11 @@ impl Cursor<RW> {
     ///
     /// ### Flags
     ///
-    /// [WriteFlags::NO_DUP_DATA] may be used to delete all data items for the
-    /// current key, if the database was opened with [DatabaseFlags::DUP_SORT].
+    /// [`WriteFlags::NO_DUP_DATA`] may be used to delete all data items for the
+    /// current key, if the database was opened with [`DatabaseFlags::DUP_SORT`].
     pub fn del(&mut self, flags: WriteFlags) -> Result<()> {
         mdbx_result(unsafe {
-            self.txn.txn_execute(|_| ffi::mdbx_cursor_del(self.cursor, flags.bits()))
+            self.txn.txn_execute(|_| ffi::mdbx_cursor_del(self.cursor, flags.bits()))?
         })?;
 
         Ok(())
@@ -467,7 +468,7 @@ where
     K: TransactionKind,
 {
     fn clone(&self) -> Self {
-        self.txn.txn_execute(|_| Self::new_at_position(self).unwrap())
+        self.txn.txn_execute(|_| Self::new_at_position(self).unwrap()).unwrap()
     }
 }
 
@@ -485,11 +486,15 @@ where
     K: TransactionKind,
 {
     fn drop(&mut self) {
-        self.txn.txn_execute(|_| unsafe { ffi::mdbx_cursor_close(self.cursor) })
+        // To be able to close a cursor of a timed out transaction, we need to renew it first.
+        // Hence the usage of `txn_execute_renew_on_timeout` here.
+        let _ = self
+            .txn
+            .txn_execute_renew_on_timeout(|_| unsafe { ffi::mdbx_cursor_close(self.cursor) });
     }
 }
 
-unsafe fn slice_to_val(slice: Option<&[u8]>) -> ffi::MDBX_val {
+const unsafe fn slice_to_val(slice: Option<&[u8]>) -> ffi::MDBX_val {
     match slice {
         Some(slice) => {
             ffi::MDBX_val { iov_len: slice.len(), iov_base: slice.as_ptr() as *mut c_void }
@@ -509,14 +514,14 @@ where
     Key: TableObject,
     Value: TableObject,
 {
-    /// An iterator that returns an error on every call to [Iter::next()].
+    /// An iterator that returns an error on every call to [`Iter::next()`].
     /// Cursor.iter*() creates an Iter of this type when MDBX returns an error
     /// on retrieval of a cursor.  Using this variant instead of returning
-    /// an error makes Cursor.iter()* methods infallible, so consumers only
-    /// need to check the result of Iter.next().
+    /// an error makes `Cursor.iter()`* methods infallible, so consumers only
+    /// need to check the result of `Iter.next()`.
     Err(Option<Error>),
 
-    /// An iterator that returns an Item on calls to [Iter::next()].
+    /// An iterator that returns an Item on calls to [`Iter::next()`].
     /// The Item is a [Result], so this variant
     /// might still return an error, if retrieval of the key/value pair
     /// fails for some reason.
@@ -524,7 +529,7 @@ where
         /// The MDBX cursor with which to iterate.
         cursor: Cursor<K>,
 
-        /// The first operation to perform when the consumer calls [Iter::next()].
+        /// The first operation to perform when the consumer calls [`Iter::next()`].
         op: ffi::MDBX_cursor_op,
 
         /// The next and subsequent operations to perform.
@@ -561,7 +566,7 @@ where
                 let mut data = ffi::MDBX_val { iov_len: 0, iov_base: ptr::null_mut() };
                 let op = mem::replace(op, *next_op);
                 unsafe {
-                    cursor.txn.txn_execute(|txn| {
+                    let result = cursor.txn.txn_execute(|txn| {
                         match ffi::mdbx_cursor_get(cursor.cursor(), &mut key, &mut data, op) {
                             ffi::MDBX_SUCCESS => {
                                 let key = match Key::decode_val::<K>(txn, key) {
@@ -574,13 +579,17 @@ where
                                 };
                                 Some(Ok((key, data)))
                             }
-                            // MDBX_ENODATA can occur when the cursor was previously seeked to a
+                            // MDBX_ENODATA can occur when the cursor was previously sought to a
                             // non-existent value, e.g. iter_from with a
                             // key greater than all values in the database.
                             ffi::MDBX_NOTFOUND | ffi::MDBX_ENODATA => None,
                             error => Some(Err(Error::from_err_code(error))),
                         }
-                    })
+                    });
+                    match result {
+                        Ok(result) => result,
+                        Err(err) => Some(Err(err)),
+                    }
                 }
             }
             Self::Err(err) => err.take().map(Err),
@@ -596,14 +605,14 @@ where
     Key: TableObject,
     Value: TableObject,
 {
-    /// An iterator that returns an error on every call to [Iter::next()].
+    /// An iterator that returns an error on every call to [`Iter::next()`].
     /// Cursor.iter*() creates an Iter of this type when MDBX returns an error
     /// on retrieval of a cursor.  Using this variant instead of returning
-    /// an error makes Cursor.iter()* methods infallible, so consumers only
-    /// need to check the result of Iter.next().
+    /// an error makes `Cursor.iter()`* methods infallible, so consumers only
+    /// need to check the result of `Iter.next()`.
     Err(Option<Error>),
 
-    /// An iterator that returns an Item on calls to [Iter::next()].
+    /// An iterator that returns an Item on calls to [`Iter::next()`].
     /// The Item is a [Result], so this variant
     /// might still return an error, if retrieval of the key/value pair
     /// fails for some reason.
@@ -611,7 +620,7 @@ where
         /// The MDBX cursor with which to iterate.
         cursor: &'cur mut Cursor<K>,
 
-        /// The first operation to perform when the consumer calls [Iter::next()].
+        /// The first operation to perform when the consumer calls [`Iter::next()`].
         op: ffi::MDBX_cursor_op,
 
         /// The next and subsequent operations to perform.
@@ -652,7 +661,7 @@ where
                 let mut data = ffi::MDBX_val { iov_len: 0, iov_base: ptr::null_mut() };
                 let op = mem::replace(op, *next_op);
                 unsafe {
-                    cursor.txn.txn_execute(|txn| {
+                    let result = cursor.txn.txn_execute(|txn| {
                         match ffi::mdbx_cursor_get(cursor.cursor(), &mut key, &mut data, op) {
                             ffi::MDBX_SUCCESS => {
                                 let key = match Key::decode_val::<K>(txn, key) {
@@ -665,13 +674,17 @@ where
                                 };
                                 Some(Ok((key, data)))
                             }
-                            // MDBX_NODATA can occur when the cursor was previously seeked to a
+                            // MDBX_NODATA can occur when the cursor was previously sought to a
                             // non-existent value, e.g. iter_from with a
                             // key greater than all values in the database.
                             ffi::MDBX_NOTFOUND | ffi::MDBX_ENODATA => None,
                             error => Some(Err(Error::from_err_code(error))),
                         }
-                    })
+                    });
+                    match result {
+                        Ok(result) => result,
+                        Err(err) => Some(Err(err)),
+                    }
                 }
             }
             Iter::Err(err) => err.take().map(Err),
@@ -689,14 +702,14 @@ where
     Key: TableObject,
     Value: TableObject,
 {
-    /// An iterator that returns an error on every call to Iter.next().
+    /// An iterator that returns an error on every call to `Iter.next()`.
     /// Cursor.iter*() creates an Iter of this type when MDBX returns an error
     /// on retrieval of a cursor.  Using this variant instead of returning
-    /// an error makes Cursor.iter()* methods infallible, so consumers only
-    /// need to check the result of Iter.next().
+    /// an error makes `Cursor.iter()`* methods infallible, so consumers only
+    /// need to check the result of `Iter.next()`.
     Err(Option<Error>),
 
-    /// An iterator that returns an Item on calls to Iter.next().
+    /// An iterator that returns an Item on calls to `Iter.next()`.
     /// The Item is a Result<(&'txn [u8], &'txn [u8])>, so this variant
     /// might still return an error, if retrieval of the key/value pair
     /// fails for some reason.
@@ -704,7 +717,7 @@ where
         /// The MDBX cursor with which to iterate.
         cursor: &'cur mut Cursor<K>,
 
-        /// The first operation to perform when the consumer calls Iter.next().
+        /// The first operation to perform when the consumer calls `Iter.next()`.
         op: MDBX_cursor_op,
 
         _marker: PhantomData<fn(&'cur (Key, Value))>,
@@ -749,7 +762,7 @@ where
                 let mut data = ffi::MDBX_val { iov_len: 0, iov_base: ptr::null_mut() };
                 let op = mem::replace(op, ffi::MDBX_NEXT_NODUP);
 
-                cursor.txn.txn_execute(|_| {
+                let result = cursor.txn.txn_execute(|_| {
                     let err_code =
                         unsafe { ffi::mdbx_cursor_get(cursor.cursor(), &mut key, &mut data, op) };
 
@@ -760,7 +773,12 @@ where
                             ffi::MDBX_NEXT_DUP,
                         )
                     })
-                })
+                });
+
+                match result {
+                    Ok(result) => result,
+                    Err(err) => Some(IntoIter::Err(Some(err))),
+                }
             }
             IterDup::Err(err) => err.take().map(|e| IntoIter::Err(Some(e))),
         }

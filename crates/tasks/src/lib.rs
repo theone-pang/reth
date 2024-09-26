@@ -1,12 +1,15 @@
 //! Reth task management.
+//!
+//! # Feature Flags
+//!
+//! - `rayon`: Enable rayon thread pool for blocking tasks.
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
     html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
-#![warn(missing_debug_implementations, missing_docs, unreachable_pub, rustdoc::all)]
-#![deny(unused_must_use, rust_2018_idioms)]
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 use crate::{
@@ -16,12 +19,12 @@ use crate::{
 use dyn_clone::DynClone;
 use futures_util::{
     future::{select, BoxFuture},
-    pin_mut, Future, FutureExt, TryFutureExt,
+    Future, FutureExt, TryFutureExt,
 };
 use std::{
     any::Any,
     fmt::{Display, Formatter},
-    pin::Pin,
+    pin::{pin, Pin},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -39,15 +42,18 @@ use tracing_futures::Instrument;
 pub mod metrics;
 pub mod shutdown;
 
+#[cfg(feature = "rayon")]
+pub mod pool;
+
 /// A type that can spawn tasks.
 ///
-/// The main purpose of this type is to abstract over [TaskExecutor] so it's more convenient to
+/// The main purpose of this type is to abstract over [`TaskExecutor`] so it's more convenient to
 /// provide default impls for testing.
 ///
 ///
 /// # Examples
 ///
-/// Use the [TokioTaskExecutor] that spawns with [tokio::task::spawn]
+/// Use the [`TokioTaskExecutor`] that spawns with [`tokio::task::spawn`]
 ///
 /// ```
 /// # async fn t() {
@@ -61,7 +67,7 @@ pub mod shutdown;
 /// # }
 /// ```
 ///
-/// Use the [TaskExecutor] that spawns task directly onto the tokio runtime via the [Handle].
+/// Use the [`TaskExecutor`] that spawns task directly onto the tokio runtime via the [Handle].
 ///
 /// ```
 /// # use reth_tasks::TaskManager;
@@ -77,7 +83,8 @@ pub mod shutdown;
 /// # }
 /// ```
 ///
-/// The [TaskSpawner] trait is [DynClone] so `Box<dyn TaskSpawner>` are also `Clone`.
+/// The [`TaskSpawner`] trait is [`DynClone`] so `Box<dyn TaskSpawner>` are also `Clone`.
+#[auto_impl::auto_impl(&, Arc)]
 pub trait TaskSpawner: Send + Sync + Unpin + std::fmt::Debug + DynClone {
     /// Spawns the task onto the runtime.
     /// See also [`Handle::spawn`].
@@ -99,7 +106,7 @@ pub trait TaskSpawner: Send + Sync + Unpin + std::fmt::Debug + DynClone {
 
 dyn_clone::clone_trait_object!(TaskSpawner);
 
-/// An [TaskSpawner] that uses [tokio::task::spawn] to execute tasks
+/// An [`TaskSpawner`] that uses [`tokio::task::spawn`] to execute tasks
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct TokioTaskExecutor;
@@ -155,13 +162,23 @@ pub struct TaskManager {
     signal: Option<Signal>,
     /// Receiver of the shutdown signal.
     on_shutdown: Shutdown,
-    /// How many [GracefulShutdown] tasks are currently active
+    /// How many [`GracefulShutdown`] tasks are currently active
     graceful_tasks: Arc<AtomicUsize>,
 }
 
 // === impl TaskManager ===
 
 impl TaskManager {
+    /// Returns a a [`TaskManager`] over the currently running Runtime.
+    ///
+    /// # Panics
+    ///
+    /// This will panic if called outside the context of a Tokio runtime.
+    pub fn current() -> Self {
+        let handle = Handle::current();
+        Self::new(handle)
+    }
+
     /// Create a new instance connected to the given handle's tokio runtime.
     pub fn new(handle: Handle) -> Self {
         let (panicked_tasks_tx, panicked_tasks_rx) = unbounded_channel();
@@ -273,7 +290,7 @@ pub struct TaskExecutor {
     panicked_tasks_tx: UnboundedSender<PanickedTaskError>,
     // Task Executor Metrics
     metrics: TaskExecutorMetrics,
-    /// How many [GracefulShutdown] tasks are currently active
+    /// How many [`GracefulShutdown`] tasks are currently active
     graceful_tasks: Arc<AtomicUsize>,
 }
 
@@ -281,16 +298,16 @@ pub struct TaskExecutor {
 
 impl TaskExecutor {
     /// Returns the [Handle] to the tokio runtime.
-    pub fn handle(&self) -> &Handle {
+    pub const fn handle(&self) -> &Handle {
         &self.handle
     }
 
     /// Returns the receiver of the shutdown signal.
-    pub fn on_shutdown_signal(&self) -> &Shutdown {
+    pub const fn on_shutdown_signal(&self) -> &Shutdown {
         &self.on_shutdown
     }
 
-    /// Spawns a future on the tokio runtime depending on the [TaskKind]
+    /// Spawns a future on the tokio runtime depending on the [`TaskKind`]
     fn spawn_on_rt<F>(&self, fut: F, task_kind: TaskKind) -> JoinHandle<()>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -304,7 +321,7 @@ impl TaskExecutor {
         }
     }
 
-    /// Spawns a regular task depending on the given [TaskKind]
+    /// Spawns a regular task depending on the given [`TaskKind`]
     fn spawn_task_as<F>(&self, fut: F, task_kind: TaskKind) -> JoinHandle<()>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -312,13 +329,15 @@ impl TaskExecutor {
         let on_shutdown = self.on_shutdown.clone();
 
         // Clone only the specific counter that we need.
-        let finished_regular_tasks_metrics = self.metrics.finished_regular_tasks.clone();
+        let finished_regular_tasks_total_metrics =
+            self.metrics.finished_regular_tasks_total.clone();
         // Wrap the original future to increment the finished tasks counter upon completion
         let task = {
             async move {
                 // Create an instance of IncCounterOnDrop with the counter to increment
-                let _inc_counter_on_drop = IncCounterOnDrop::new(finished_regular_tasks_metrics);
-                pin_mut!(fut);
+                let _inc_counter_on_drop =
+                    IncCounterOnDrop::new(finished_regular_tasks_total_metrics);
+                let fut = pin!(fut);
                 let _ = select(on_shutdown, fut).await;
             }
         }
@@ -365,7 +384,7 @@ impl TaskExecutor {
         self.handle.spawn(task)
     }
 
-    /// Spawns a critical task depending on the given [TaskKind]
+    /// Spawns a critical task depending on the given [`TaskKind`]
     fn spawn_critical_as<F>(
         &self,
         name: &'static str,
@@ -389,11 +408,12 @@ impl TaskExecutor {
             .in_current_span();
 
         // Clone only the specific counter that we need.
-        let finished_critical_tasks_metrics = self.metrics.finished_critical_tasks.clone();
+        let finished_critical_tasks_total_metrics =
+            self.metrics.finished_critical_tasks_total.clone();
         let task = async move {
             // Create an instance of IncCounterOnDrop with the counter to increment
-            let _inc_counter_on_drop = IncCounterOnDrop::new(finished_critical_tasks_metrics);
-            pin_mut!(task);
+            let _inc_counter_on_drop = IncCounterOnDrop::new(finished_critical_tasks_total_metrics);
+            let task = pin!(task);
             let _ = select(on_shutdown, task).await;
         };
 
@@ -445,7 +465,7 @@ impl TaskExecutor {
                 error!("{task_error}");
                 let _ = panicked_tasks_tx.send(task_error);
             })
-            .map(|_| ())
+            .map(drop)
             .in_current_span();
 
         self.handle.spawn(task)
@@ -453,8 +473,8 @@ impl TaskExecutor {
 
     /// This spawns a critical task onto the runtime.
     ///
-    /// If this task panics, the [TaskManager] is notified.
-    /// The [TaskManager] will wait until the given future has completed before shutting down.
+    /// If this task panics, the [`TaskManager`] is notified.
+    /// The [`TaskManager`] will wait until the given future has completed before shutting down.
     ///
     /// # Example
     ///
@@ -494,10 +514,45 @@ impl TaskExecutor {
                 error!("{task_error}");
                 let _ = panicked_tasks_tx.send(task_error);
             })
-            .map(|_| ())
+            .map(drop)
             .in_current_span();
 
         self.handle.spawn(task)
+    }
+
+    /// This spawns a regular task onto the runtime.
+    ///
+    /// The [`TaskManager`] will wait until the given future has completed before shutting down.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn t(executor: reth_tasks::TaskExecutor) {
+    ///
+    /// executor.spawn_with_graceful_shutdown_signal(|shutdown| async move {
+    ///     // await the shutdown signal
+    ///     let guard = shutdown.await;
+    ///     // do work before exiting the program
+    ///     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    ///     // allow graceful shutdown
+    ///     drop(guard);
+    /// });
+    /// # }
+    /// ```
+    pub fn spawn_with_graceful_shutdown_signal<F>(
+        &self,
+        f: impl FnOnce(GracefulShutdown) -> F,
+    ) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let on_shutdown = GracefulShutdown::new(
+            self.on_shutdown.clone(),
+            GracefulShutdownGuard::new(Arc::clone(&self.graceful_tasks)),
+        );
+        let fut = f(on_shutdown);
+
+        self.handle.spawn(fut)
     }
 }
 
@@ -509,7 +564,7 @@ impl TaskSpawner for TaskExecutor {
 
     fn spawn_critical(&self, name: &'static str, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
         self.metrics.inc_critical_tasks();
-        TaskExecutor::spawn_critical(self, name, fut)
+        Self::spawn_critical(self, name, fut)
     }
 
     fn spawn_blocking(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
@@ -521,15 +576,64 @@ impl TaskSpawner for TaskExecutor {
         name: &'static str,
         fut: BoxFuture<'static, ()>,
     ) -> JoinHandle<()> {
-        TaskExecutor::spawn_critical_blocking(self, name, fut)
+        Self::spawn_critical_blocking(self, name, fut)
+    }
+}
+
+/// `TaskSpawner` with extended behaviour
+#[auto_impl::auto_impl(&, Arc)]
+pub trait TaskSpawnerExt: Send + Sync + Unpin + std::fmt::Debug + DynClone {
+    /// This spawns a critical task onto the runtime.
+    ///
+    /// If this task panics, the [`TaskManager`] is notified.
+    /// The [`TaskManager`] will wait until the given future has completed before shutting down.
+    fn spawn_critical_with_graceful_shutdown_signal<F>(
+        &self,
+        name: &'static str,
+        f: impl FnOnce(GracefulShutdown) -> F,
+    ) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static;
+
+    /// This spawns a regular task onto the runtime.
+    ///
+    /// The [`TaskManager`] will wait until the given future has completed before shutting down.
+    fn spawn_with_graceful_shutdown_signal<F>(
+        &self,
+        f: impl FnOnce(GracefulShutdown) -> F,
+    ) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static;
+}
+
+impl TaskSpawnerExt for TaskExecutor {
+    fn spawn_critical_with_graceful_shutdown_signal<F>(
+        &self,
+        name: &'static str,
+        f: impl FnOnce(GracefulShutdown) -> F,
+    ) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        Self::spawn_critical_with_graceful_shutdown_signal(self, name, f)
+    }
+
+    fn spawn_with_graceful_shutdown_signal<F>(
+        &self,
+        f: impl FnOnce(GracefulShutdown) -> F,
+    ) -> JoinHandle<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        Self::spawn_with_graceful_shutdown_signal(self, f)
     }
 }
 
 /// Determines how a task is spawned
 enum TaskKind {
-    /// Spawn the task to the default executor [Handle::spawn]
+    /// Spawn the task to the default executor [`Handle::spawn`]
     Default,
-    /// Spawn the task to the blocking executor [Handle::spawn_blocking]
+    /// Spawn the task to the blocking executor [`Handle::spawn_blocking`]
     Blocking,
 }
 
@@ -559,10 +663,7 @@ mod tests {
         let manager = TaskManager::new(handle);
         let executor = manager.executor();
 
-        executor.spawn_critical(
-            "this is a critical task",
-            Box::pin(async { panic!("intentionally panic") }),
-        );
+        executor.spawn_critical("this is a critical task", async { panic!("intentionally panic") });
 
         runtime.block_on(async move {
             let err = manager.await;
@@ -581,13 +682,10 @@ mod tests {
 
         let (signal, shutdown) = signal();
 
-        executor.spawn_critical(
-            "this is a critical task",
-            Box::pin(async move {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                drop(signal);
-            }),
-        );
+        executor.spawn_critical("this is a critical task", async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(signal);
+        });
 
         drop(manager);
 
@@ -618,7 +716,7 @@ mod tests {
     fn test_manager_graceful_shutdown() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let handle = runtime.handle().clone();
-        let manager = TaskManager::new(handle.clone());
+        let manager = TaskManager::new(handle);
         let executor = manager.executor();
 
         let val = Arc::new(AtomicBool::new(false));
@@ -637,9 +735,8 @@ mod tests {
     fn test_manager_graceful_shutdown_many() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let handle = runtime.handle().clone();
-        let manager = TaskManager::new(handle.clone());
+        let manager = TaskManager::new(handle);
         let executor = manager.executor();
-        let _e = executor.clone();
 
         let counter = Arc::new(AtomicUsize::new(0));
         let num = 10;
@@ -663,7 +760,7 @@ mod tests {
     fn test_manager_graceful_shutdown_timeout() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let handle = runtime.handle().clone();
-        let manager = TaskManager::new(handle.clone());
+        let manager = TaskManager::new(handle);
         let executor = manager.executor();
 
         let timeout = Duration::from_millis(500);

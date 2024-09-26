@@ -7,26 +7,62 @@
     html_favicon_url = "https://avatars0.githubusercontent.com/u/97369466?s=256",
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
-#![warn(missing_debug_implementations, missing_docs, unreachable_pub, rustdoc::all)]
-#![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
-
-mod admin;
-pub mod beacon;
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#[allow(hidden_glob_reexports)]
 mod eth;
-mod mev;
-mod net;
-mod otterscan;
-mod peer;
-pub mod relay;
-mod rpc;
-pub mod serde_helpers;
 
-pub use admin::*;
-pub use eth::*;
-pub use mev::*;
-pub use net::*;
-pub use otterscan::*;
-pub use peer::*;
-pub use rpc::*;
-pub use serde_helpers::*;
+/// Alias for a peer identifier
+pub type PeerId = B512;
+
+use alloy_primitives::B512;
+// re-export for convenience
+pub use alloy_rpc_types::serde_helpers;
+
+// Ethereum specific rpc types coming from alloy.
+pub use alloy_rpc_types::*;
+
+// Ethereum specific serde types coming from alloy.
+pub use alloy_serde::*;
+
+pub mod trace {
+    //! RPC types for trace endpoints and inspectors.
+    pub use alloy_rpc_types_trace::*;
+}
+
+// re-export admin
+pub use alloy_rpc_types_admin as admin;
+
+// Anvil specific rpc types coming from alloy.
+pub use alloy_rpc_types_anvil as anvil;
+
+// re-export mev
+pub use alloy_rpc_types_mev as mev;
+
+// re-export beacon
+#[cfg(feature = "jsonrpsee-types")]
+pub use alloy_rpc_types_beacon as beacon;
+
+// re-export txpool
+pub use alloy_rpc_types_txpool as txpool;
+
+// re-export debug
+pub use alloy_rpc_types_debug as debug;
+
+// Ethereum specific rpc types related to typed transaction requests and the engine API.
+#[cfg(feature = "jsonrpsee-types")]
+pub use eth::error::ToRpcError;
+pub use eth::transaction::{self, TransactionRequest, TypedTransactionRequest};
+#[cfg(feature = "jsonrpsee-types")]
+pub use eth::{
+    engine,
+    engine::{
+        ExecutionPayload, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3, PayloadError,
+    },
+};
+
+/// Optimism specific rpc types.
+pub mod optimism {
+    pub use op_alloy_rpc_types::*;
+    pub use op_alloy_rpc_types_engine::*;
+}

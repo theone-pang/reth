@@ -1,11 +1,11 @@
+use alloy_primitives::BlockNumber;
 use futures::Stream;
 use futures_util::{FutureExt, StreamExt};
 use pin_project::pin_project;
-use reth_interfaces::p2p::{
+use reth_network_p2p::{
     bodies::downloader::{BodyDownloader, BodyDownloaderResult},
     error::DownloadResult,
 };
-use reth_primitives::BlockNumber;
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use std::{
     future::Future,
@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, mpsc::UnboundedSender};
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tokio_util::sync::PollSender;
 
-/// The maximum number of [BodyDownloaderResult]s to hold in the buffer.
+/// The maximum number of [`BodyDownloaderResult`]s to hold in the buffer.
 pub const BODIES_TASK_BUFFER_SIZE: usize = 4;
 
 /// A [BodyDownloader] that drives a spawned [BodyDownloader] on a spawned task.
@@ -32,7 +32,7 @@ pub struct TaskDownloader {
 // === impl TaskDownloader ===
 
 impl TaskDownloader {
-    /// Spawns the given `downloader` via [tokio::task::spawn] returns a [TaskDownloader] that's
+    /// Spawns the given `downloader` via [`tokio::task::spawn`] returns a [`TaskDownloader`] that's
     /// connected to that task.
     ///
     /// # Panics
@@ -42,9 +42,10 @@ impl TaskDownloader {
     /// # Example
     ///
     /// ```
+    /// use reth_consensus::Consensus;
     /// use reth_downloaders::bodies::{bodies::BodiesDownloaderBuilder, task::TaskDownloader};
-    /// use reth_interfaces::{consensus::Consensus, p2p::bodies::client::BodiesClient};
-    /// use reth_provider::HeaderProvider;
+    /// use reth_network_p2p::bodies::client::BodiesClient;
+    /// use reth_storage_api::HeaderProvider;
     /// use std::sync::Arc;
     ///
     /// fn t<B: BodiesClient + 'static, Provider: HeaderProvider + Unpin + 'static>(
@@ -63,8 +64,8 @@ impl TaskDownloader {
         Self::spawn_with(downloader, &TokioTaskExecutor::default())
     }
 
-    /// Spawns the given `downloader` via the given [TaskSpawner] returns a [TaskDownloader] that's
-    /// connected to that task.
+    /// Spawns the given `downloader` via the given [`TaskSpawner`] returns a [`TaskDownloader`]
+    /// that's connected to that task.
     pub fn spawn_with<T, S>(downloader: T, spawner: &S) -> Self
     where
         T: BodyDownloader + 'static,
@@ -100,7 +101,7 @@ impl Stream for TaskDownloader {
     }
 }
 
-/// A [BodyDownloader] that runs on its own task
+/// A [`BodyDownloader`] that runs on its own task
 struct SpawnedDownloader<T> {
     updates: UnboundedReceiverStream<RangeInclusive<BlockNumber>>,
     bodies_tx: PollSender<BodyDownloaderResult>,
@@ -117,7 +118,7 @@ impl<T: BodyDownloader> Future for SpawnedDownloader<T> {
             while let Poll::Ready(update) = this.updates.poll_next_unpin(cx) {
                 if let Some(range) = update {
                     if let Err(err) = this.downloader.set_download_range(range) {
-                        tracing::error!(target: "downloaders::bodies", ?err, "Failed to set bodies download range");
+                        tracing::error!(target: "downloaders::bodies", %err, "Failed to set bodies download range");
 
                         // Clone the sender ensure its availability. See [PollSender::clone].
                         let mut bodies_tx = this.bodies_tx.clone();
@@ -169,20 +170,19 @@ mod tests {
         test_utils::{generate_bodies, TestBodiesClient},
     };
     use assert_matches::assert_matches;
-    use reth_db::test_utils::create_test_rw_db;
-    use reth_interfaces::{p2p::error::DownloadError, test_utils::TestConsensus};
-    use reth_primitives::MAINNET;
-    use reth_provider::ProviderFactory;
+    use reth_consensus::test_utils::TestConsensus;
+    use reth_network_p2p::error::DownloadError;
+    use reth_provider::test_utils::create_test_provider_factory;
     use std::sync::Arc;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn download_one_by_one_on_task() {
         reth_tracing::init_test_tracing();
 
-        let db = create_test_rw_db();
+        let factory = create_test_provider_factory();
         let (headers, mut bodies) = generate_bodies(0..=19);
 
-        insert_headers(db.db(), &headers);
+        insert_headers(factory.db_ref().db(), &headers);
 
         let client = Arc::new(
             TestBodiesClient::default().with_bodies(bodies.clone()).with_should_delay(true),
@@ -190,7 +190,7 @@ mod tests {
         let downloader = BodiesDownloaderBuilder::default().build(
             client.clone(),
             Arc::new(TestConsensus::default()),
-            ProviderFactory::new(db, MAINNET.clone()),
+            factory,
         );
         let mut downloader = TaskDownloader::spawn(downloader);
 
@@ -207,12 +207,12 @@ mod tests {
     #[allow(clippy::reversed_empty_ranges)]
     async fn set_download_range_error_returned() {
         reth_tracing::init_test_tracing();
+        let factory = create_test_provider_factory();
 
-        let db = create_test_rw_db();
         let downloader = BodiesDownloaderBuilder::default().build(
             Arc::new(TestBodiesClient::default()),
             Arc::new(TestConsensus::default()),
-            ProviderFactory::new(db, MAINNET.clone()),
+            factory,
         );
         let mut downloader = TaskDownloader::spawn(downloader);
 

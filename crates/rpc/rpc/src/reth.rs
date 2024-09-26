@@ -1,12 +1,14 @@
-use crate::eth::error::{EthApiError, EthResult};
+use std::{collections::HashMap, future::Future, sync::Arc};
+
+use alloy_primitives::{Address, U256};
 use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
-use reth_interfaces::RethResult;
-use reth_primitives::{Address, BlockId, U256};
+use reth_errors::RethResult;
+use reth_primitives::BlockId;
 use reth_provider::{BlockReaderIdExt, ChangeSetReader, StateProviderFactory};
 use reth_rpc_api::RethApiServer;
+use reth_rpc_eth_types::{EthApiError, EthResult};
 use reth_tasks::TaskSpawner;
-use std::{collections::HashMap, future::Future, sync::Arc};
 use tokio::sync::oneshot;
 
 /// `reth` API implementation.
@@ -24,7 +26,7 @@ impl<Provider> RethApi<Provider> {
         &self.inner.provider
     }
 
-    /// Create a new instance of the [RethApi]
+    /// Create a new instance of the [`RethApi`]
     pub fn new(provider: Provider, task_spawner: Box<dyn TaskSpawner>) -> Self {
         let inner = Arc::new(RethApiInner { provider, task_spawner });
         Self { inner }
@@ -63,7 +65,7 @@ where
 
     fn try_balance_changes_in_block(&self, block_id: BlockId) -> EthResult<HashMap<Address, U256>> {
         let Some(block_number) = self.provider().block_number_for_id(block_id)? else {
-            return Err(EthApiError::UnknownBlockNumber)
+            return Err(EthApiError::HeaderNotFound(block_id))
         };
 
         let state = self.provider().state_by_block_id(block_id)?;
@@ -93,7 +95,7 @@ where
         &self,
         block_id: BlockId,
     ) -> RpcResult<HashMap<Address, U256>> {
-        Ok(RethApi::balance_changes_in_block(self, block_id).await?)
+        Ok(Self::balance_changes_in_block(self, block_id).await?)
     }
 }
 

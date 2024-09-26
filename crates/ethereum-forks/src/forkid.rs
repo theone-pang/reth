@@ -3,34 +3,33 @@
 //! Previously version of Apache licenced [`ethereum-forkid`](https://crates.io/crates/ethereum-forkid).
 
 use crate::Head;
-use alloy_primitives::{hex, BlockNumber, B256};
-use alloy_rlp::*;
-use crc::*;
-use reth_codecs::derive_arbitrary;
-use serde::{Deserialize, Serialize};
-use std::{
-    cmp::Ordering,
+use alloc::{
     collections::{BTreeMap, BTreeSet},
+    vec::Vec,
+};
+use alloy_primitives::{hex, BlockNumber, B256};
+use alloy_rlp::{Error as RlpError, *};
+#[cfg(any(test, feature = "arbitrary"))]
+use arbitrary::Arbitrary;
+use core::{
+    cmp::Ordering,
     fmt,
     ops::{Add, AddAssign},
 };
-use thiserror::Error;
+use crc::*;
+#[cfg(any(test, feature = "arbitrary"))]
+use proptest_derive::Arbitrary as PropTestArbitrary;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 const CRC_32_IEEE: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
+const TIMESTAMP_BEFORE_ETHEREUM_MAINNET: u64 = 1_300_000_000;
 
 /// `CRC32` hash of all previous forks starting from genesis block.
-#[derive_arbitrary(rlp)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(any(test, feature = "arbitrary"), derive(PropTestArbitrary, Arbitrary))]
 #[derive(
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    RlpEncodableWrapper,
-    RlpDecodableWrapper,
-    RlpMaxEncodedLen,
-    Serialize,
-    Deserialize,
+    Clone, Copy, PartialEq, Eq, Hash, RlpEncodableWrapper, RlpDecodableWrapper, RlpMaxEncodedLen,
 )]
 pub struct ForkHash(pub [u8; 4]);
 
@@ -72,7 +71,8 @@ where
 }
 
 /// How to filter forks.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForkFilterKey {
     /// By block number activation.
     Block(BlockNumber),
@@ -89,9 +89,8 @@ impl PartialOrd for ForkFilterKey {
 impl Ord for ForkFilterKey {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
-            (ForkFilterKey::Block(a), ForkFilterKey::Block(b)) => a.cmp(b),
-            (ForkFilterKey::Time(a), ForkFilterKey::Time(b)) => a.cmp(b),
-            (ForkFilterKey::Block(_), ForkFilterKey::Time(_)) => Ordering::Less,
+            (Self::Block(a), Self::Block(b)) | (Self::Time(a), Self::Time(b)) => a.cmp(b),
+            (Self::Block(_), Self::Time(_)) => Ordering::Less,
             _ => Ordering::Greater,
         }
     }
@@ -108,20 +107,9 @@ impl From<ForkFilterKey> for u64 {
 
 /// A fork identifier as defined by EIP-2124.
 /// Serves as the chain compatibility identifier.
-#[derive_arbitrary(rlp)]
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    Hash,
-    RlpEncodable,
-    RlpDecodable,
-    RlpMaxEncodedLen,
-    Serialize,
-    Deserialize,
-)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(any(test, feature = "arbitrary"), derive(PropTestArbitrary, Arbitrary))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, RlpEncodable, RlpDecodable, RlpMaxEncodedLen)]
 pub struct ForkId {
     /// CRC32 checksum of the all fork blocks and timestamps from genesis.
     pub hash: ForkHash,
@@ -129,8 +117,66 @@ pub struct ForkId {
     pub next: u64,
 }
 
+/// Represents a forward-compatible ENR entry for including the forkid in a node record via
+/// EIP-868. Forward compatibility is achieved via EIP-8.
+///
+/// See:
+/// <https://github.com/ethereum/devp2p/blob/master/enr-entries/eth.md#entry-format>
+///
+/// for how geth implements `ForkId` values and forward compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, RlpEncodable)]
+pub struct EnrForkIdEntry {
+    /// The inner forkid
+    pub fork_id: ForkId,
+}
+
+impl Decodable for EnrForkIdEntry {
+    // NOTE(onbjerg): Manual implementation to satisfy EIP-8.
+    //
+    // See https://eips.ethereum.org/EIPS/eip-8
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let b = &mut &**buf;
+        let rlp_head = Header::decode(b)?;
+        if !rlp_head.list {
+            return Err(RlpError::UnexpectedString)
+        }
+        let started_len = b.len();
+
+        let this = Self { fork_id: Decodable::decode(b)? };
+
+        // NOTE(onbjerg): Because of EIP-8, we only check that we did not consume *more* than the
+        // payload length, i.e. it is ok if payload length is greater than what we consumed, as we
+        // just discard the remaining list items
+        let consumed = started_len - b.len();
+        if consumed > rlp_head.payload_length {
+            return Err(RlpError::ListLengthMismatch {
+                expected: rlp_head.payload_length,
+                got: consumed,
+            })
+        }
+
+        let rem = rlp_head.payload_length - consumed;
+        b.advance(rem);
+        *buf = *b;
+
+        Ok(this)
+    }
+}
+
+impl From<ForkId> for EnrForkIdEntry {
+    fn from(fork_id: ForkId) -> Self {
+        Self { fork_id }
+    }
+}
+
+impl From<EnrForkIdEntry> for ForkId {
+    fn from(entry: EnrForkIdEntry) -> Self {
+        entry.fork_id
+    }
+}
+
 /// Reason for rejecting provided `ForkId`.
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, thiserror_no_std::Error, PartialEq, Eq, Hash)]
 pub enum ValidationError {
     /// Remote node is outdated and needs a software update.
     #[error(
@@ -139,7 +185,7 @@ pub enum ValidationError {
     RemoteStale {
         /// locally configured forkId
         local: ForkId,
-        /// ForkId received from remote
+        /// `ForkId` received from remote
         remote: ForkId,
     },
     /// Local node is on an incompatible chain or needs a software update.
@@ -147,14 +193,15 @@ pub enum ValidationError {
     LocalIncompatibleOrStale {
         /// locally configured forkId
         local: ForkId,
-        /// ForkId received from remote
+        /// `ForkId` received from remote
         remote: ForkId,
     },
 }
 
 /// Filter that describes the state of blockchain and can be used to check incoming `ForkId`s for
 /// compatibility.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForkFilter {
     /// The forks in the filter are keyed by `(timestamp, block)`. This ensures that block-based
     /// forks (`time == 0`) are processed before time-based forks as required by
@@ -191,6 +238,8 @@ impl ForkFilter {
                 ForkFilterKey::Block(_) => true,
                 ForkFilterKey::Time(time) => *time > genesis_timestamp,
             })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .fold(
                 (BTreeMap::from([(ForkFilterKey::Block(0), genesis_fork_hash)]), genesis_fork_hash),
                 |(mut acc, base_hash), key| {
@@ -201,8 +250,10 @@ impl ForkFilter {
             )
             .0;
 
+        // Compute cache based on filtered forks and the current head.
         let cache = Cache::compute_cache(&forks, head);
 
+        // Create and return a new `ForkFilter`.
         Self { forks, head, cache }
     }
 
@@ -221,16 +272,14 @@ impl ForkFilter {
             head_in_past || head_in_future
         };
 
-        let mut transition = None;
-
         // recompute the cache
-        if recompute_cache {
+        let transition = if recompute_cache {
             let past = self.current();
-
             self.cache = Cache::compute_cache(&self.forks, head);
-
-            transition = Some(ForkTransition { current: self.current(), past })
-        }
+            Some(ForkTransition { current: self.current(), past })
+        } else {
+            None
+        };
 
         self.head = head;
 
@@ -250,6 +299,15 @@ impl ForkFilter {
         self.cache.fork_id
     }
 
+    /// Manually set the current fork id.
+    ///
+    /// Caution: this disregards all configured fork filters and is reset on the next head update.
+    /// This is useful for testing or to connect to networks over p2p where only the latest forkid
+    /// is known.
+    pub fn set_current_fork_id(&mut self, fork_id: ForkId) {
+        self.cache.fork_id = fork_id;
+    }
+
     /// Check whether the provided `ForkId` is compatible based on the validation rules in
     /// `EIP-2124`.
     ///
@@ -266,16 +324,25 @@ impl ForkFilter {
                 return Ok(())
             }
 
-            // We check if this fork is time-based or block number-based
-            // NOTE: This is a bit hacky but I'm unsure how else we can figure out when to use
-            // timestamp vs when to use block number..
-            let head_block_or_time = match self.cache.epoch_start {
-                ForkFilterKey::Block(_) => self.head.number,
-                ForkFilterKey::Time(_) => self.head.timestamp,
+            let is_incompatible = if self.head.number < TIMESTAMP_BEFORE_ETHEREUM_MAINNET {
+                // When the block number is less than an old timestamp before Ethereum mainnet,
+                // we check if this fork is time-based or block number-based by estimating that,
+                // if fork_id.next is bigger than the old timestamp, we are dealing with a
+                // timestamp, otherwise with a block.
+                (fork_id.next > TIMESTAMP_BEFORE_ETHEREUM_MAINNET &&
+                    self.head.timestamp >= fork_id.next) ||
+                    (fork_id.next <= TIMESTAMP_BEFORE_ETHEREUM_MAINNET &&
+                        self.head.number >= fork_id.next)
+            } else {
+                // Extra safety check to future-proof for when Ethereum has over a billion blocks.
+                let head_block_or_time = match self.cache.epoch_start {
+                    ForkFilterKey::Block(_) => self.head.number,
+                    ForkFilterKey::Time(_) => self.head.timestamp,
+                };
+                head_block_or_time >= fork_id.next
             };
 
-            //... compare local head to FORK_NEXT.
-            return if head_block_or_time >= fork_id.next {
+            return if is_incompatible {
                 // 1a) A remotely announced but remotely not passed block is already passed locally,
                 // disconnect, since the chains are incompatible.
                 Err(ValidationError::LocalIncompatibleOrStale {
@@ -324,13 +391,14 @@ impl ForkFilter {
 /// See also [`ForkFilter::set_head`]
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ForkTransition {
-    /// The new, active ForkId
+    /// The new, active `ForkId`
     pub current: ForkId,
-    /// The previously active ForkId before the transition
+    /// The previously active `ForkId` before the transition
     pub past: ForkId,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Cache {
     // An epoch is a period between forks.
     // When we progress from one fork to the next one we move to the next epoch.
@@ -344,19 +412,23 @@ struct Cache {
 impl Cache {
     /// Compute cache.
     fn compute_cache(forks: &BTreeMap<ForkFilterKey, ForkHash>, head: Head) -> Self {
+        // Prepare vectors to store past and future forks.
         let mut past = Vec::with_capacity(forks.len());
         let mut future = Vec::with_capacity(forks.len());
 
+        // Initialize variables to track the epoch range.
         let mut epoch_start = ForkFilterKey::Block(0);
         let mut epoch_end = None;
+
+        // Iterate through forks and categorize them into past and future.
         for (key, hash) in forks {
-            let active = if let ForkFilterKey::Block(block) = key {
-                *block <= head.number
-            } else if let ForkFilterKey::Time(time) = key {
-                *time <= head.timestamp
-            } else {
-                unreachable!()
+            // Check if the fork is active based on its type (Block or Time).
+            let active = match key {
+                ForkFilterKey::Block(block) => *block <= head.number,
+                ForkFilterKey::Time(time) => *time <= head.timestamp,
             };
+
+            // Categorize forks into past or future based on activity.
             if active {
                 epoch_start = *key;
                 past.push((*key, *hash));
@@ -368,11 +440,13 @@ impl Cache {
             }
         }
 
+        // Create ForkId using the last past fork's hash and the next epoch start.
         let fork_id = ForkId {
-            hash: past.last().expect("there is always at least one - genesis - fork hash; qed").1,
+            hash: past.last().expect("there is always at least one - genesis - fork hash").1,
             next: epoch_end.unwrap_or(ForkFilterKey::Block(0)).into(),
         };
 
+        // Return the computed cache.
         Self { epoch_start, epoch_end, past, future, fork_id }
     }
 }
@@ -534,6 +608,72 @@ mod tests {
             filter.validate(remote),
             Err(ValidationError::LocalIncompatibleOrStale { local: filter.current(), remote })
         );
+
+        // Block far in the future (block number bigger than TIMESTAMP_BEFORE_ETHEREUM_MAINNET), not
+        // compatible.
+        filter
+            .set_head(Head { number: TIMESTAMP_BEFORE_ETHEREUM_MAINNET + 1, ..Default::default() });
+        let remote = ForkId {
+            hash: ForkHash(hex!("668db0af")),
+            next: TIMESTAMP_BEFORE_ETHEREUM_MAINNET + 1,
+        };
+        assert_eq!(
+            filter.validate(remote),
+            Err(ValidationError::LocalIncompatibleOrStale { local: filter.current(), remote })
+        );
+
+        // Block far in the future (block number bigger than TIMESTAMP_BEFORE_ETHEREUM_MAINNET),
+        // compatible.
+        filter
+            .set_head(Head { number: TIMESTAMP_BEFORE_ETHEREUM_MAINNET + 1, ..Default::default() });
+        let remote = ForkId {
+            hash: ForkHash(hex!("668db0af")),
+            next: TIMESTAMP_BEFORE_ETHEREUM_MAINNET + 2,
+        };
+        assert_eq!(filter.validate(remote), Ok(()));
+
+        // block number smaller than TIMESTAMP_BEFORE_ETHEREUM_MAINNET and
+        // fork_id.next > TIMESTAMP_BEFORE_ETHEREUM_MAINNET && self.head.timestamp >= fork_id.next,
+        // not compatible.
+        filter.set_head(Head {
+            number: TIMESTAMP_BEFORE_ETHEREUM_MAINNET - 1,
+            timestamp: TIMESTAMP_BEFORE_ETHEREUM_MAINNET + 2,
+            ..Default::default()
+        });
+        let remote = ForkId {
+            hash: ForkHash(hex!("668db0af")),
+            next: TIMESTAMP_BEFORE_ETHEREUM_MAINNET + 1,
+        };
+        assert_eq!(
+            filter.validate(remote),
+            Err(ValidationError::LocalIncompatibleOrStale { local: filter.current(), remote })
+        );
+
+        // block number smaller than TIMESTAMP_BEFORE_ETHEREUM_MAINNET and
+        // fork_id.next <= TIMESTAMP_BEFORE_ETHEREUM_MAINNET && self.head.number >= fork_id.next,
+        // not compatible.
+        filter
+            .set_head(Head { number: TIMESTAMP_BEFORE_ETHEREUM_MAINNET - 1, ..Default::default() });
+        let remote = ForkId {
+            hash: ForkHash(hex!("668db0af")),
+            next: TIMESTAMP_BEFORE_ETHEREUM_MAINNET - 2,
+        };
+        assert_eq!(
+            filter.validate(remote),
+            Err(ValidationError::LocalIncompatibleOrStale { local: filter.current(), remote })
+        );
+
+        // block number smaller than TIMESTAMP_BEFORE_ETHEREUM_MAINNET and
+        // !((fork_id.next > TIMESTAMP_BEFORE_ETHEREUM_MAINNET && self.head.timestamp >=
+        // fork_id.next) || (fork_id.next <= TIMESTAMP_BEFORE_ETHEREUM_MAINNET && self.head.number
+        // >= fork_id.next)), compatible.
+        filter
+            .set_head(Head { number: TIMESTAMP_BEFORE_ETHEREUM_MAINNET - 2, ..Default::default() });
+        let remote = ForkId {
+            hash: ForkHash(hex!("668db0af")),
+            next: TIMESTAMP_BEFORE_ETHEREUM_MAINNET - 1,
+        };
+        assert_eq!(filter.validate(remote), Ok(()));
     }
 
     #[test]
@@ -563,6 +703,25 @@ mod tests {
             ForkId::decode(&mut (&hex!("ce84ffffffff88ffffffffffffffff") as &[u8])).unwrap(),
             ForkId { hash: ForkHash(hex!("ffffffff")), next: u64::MAX }
         );
+    }
+
+    #[test]
+    fn fork_id_rlp() {
+        // <https://github.com/ethereum/go-ethereum/blob/767b00b0b514771a663f3362dd0310fc28d40c25/core/forkid/forkid_test.go#L370-L370>
+        let val = hex!("c6840000000080");
+        let id = ForkId::decode(&mut &val[..]).unwrap();
+        assert_eq!(id, ForkId { hash: ForkHash(hex!("00000000")), next: 0 });
+        assert_eq!(alloy_rlp::encode(id), &val[..]);
+
+        let val = hex!("ca84deadbeef84baddcafe");
+        let id = ForkId::decode(&mut &val[..]).unwrap();
+        assert_eq!(id, ForkId { hash: ForkHash(hex!("deadbeef")), next: 0xBADDCAFE });
+        assert_eq!(alloy_rlp::encode(id), &val[..]);
+
+        let val = hex!("ce84ffffffff88ffffffffffffffff");
+        let id = ForkId::decode(&mut &val[..]).unwrap();
+        assert_eq!(id, ForkId { hash: ForkHash(u32::MAX.to_be_bytes()), next: u64::MAX });
+        assert_eq!(alloy_rlp::encode(id), &val[..]);
     }
 
     #[test]
@@ -610,5 +769,40 @@ mod tests {
 
         assert!(fork_filter.set_head_priv(Head { number: b2, ..Default::default() }).is_some());
         assert_eq!(fork_filter.current(), h2);
+    }
+
+    mod eip8 {
+        use super::*;
+
+        fn junk_enr_fork_id_entry() -> Vec<u8> {
+            let mut buf = Vec::new();
+            // enr request is just an expiration
+            let fork_id = ForkId { hash: ForkHash(hex!("deadbeef")), next: 0xBADDCAFE };
+
+            // add some junk
+            let junk: u64 = 112233;
+
+            // rlp header encoding
+            let payload_length = fork_id.length() + junk.length();
+            alloy_rlp::Header { list: true, payload_length }.encode(&mut buf);
+
+            // fields
+            fork_id.encode(&mut buf);
+            junk.encode(&mut buf);
+
+            buf
+        }
+
+        #[test]
+        fn eip8_decode_enr_fork_id_entry() {
+            let enr_fork_id_entry_with_junk = junk_enr_fork_id_entry();
+
+            let mut buf = enr_fork_id_entry_with_junk.as_slice();
+            let decoded = EnrForkIdEntry::decode(&mut buf).unwrap();
+            assert_eq!(
+                decoded.fork_id,
+                ForkId { hash: ForkHash(hex!("deadbeef")), next: 0xBADDCAFE }
+            );
+        }
     }
 }

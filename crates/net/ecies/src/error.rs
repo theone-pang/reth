@@ -3,6 +3,7 @@ use std::fmt;
 use thiserror::Error;
 
 /// An error that occurs while reading or writing to an ECIES stream.
+#[derive(Debug, Error)]
 pub struct ECIESError {
     inner: Box<ECIESErrorImpl>,
 }
@@ -14,21 +15,9 @@ impl ECIESError {
     }
 }
 
-impl fmt::Debug for ECIESError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&*self.inner, f)
-    }
-}
-
 impl fmt::Display for ECIESError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&*self.inner, f)
-    }
-}
-
-impl std::error::Error for ECIESError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.inner.source()
     }
 }
 
@@ -65,6 +54,9 @@ pub enum ECIESErrorImpl {
     /// Error when converting to integer
     #[error(transparent)]
     FromInt(std::num::TryFromIntError),
+    /// The encrypted data is not large enough for all fields
+    #[error("encrypted data is not large enough for all fields")]
+    EncryptedDataTooSmall,
     /// Error when trying to split an array beyond its length
     #[error("requested {idx} but array len is {len}")]
     OutOfBounds {
@@ -85,15 +77,18 @@ pub enum ECIESErrorImpl {
     ///
     /// This exact error case happens when the wrapped stream in
     /// [`Framed`](tokio_util::codec::Framed) is closed by the peer, See
-    /// [ConnectionReset](std::io::ErrorKind::ConnectionReset) and the ecies codec fails to decode
-    /// a message from the (partially filled) buffer.
+    /// [`ConnectionReset`](std::io::ErrorKind::ConnectionReset) and the ecies codec fails to
+    /// decode a message from the (partially filled) buffer.
     #[error("stream closed due to not being readable")]
     UnreadableStream,
+    /// Error when data is not received from peer for a prolonged period.
+    #[error("never received data from remote peer")]
+    StreamTimeout,
 }
 
 impl From<ECIESErrorImpl> for ECIESError {
     fn from(source: ECIESErrorImpl) -> Self {
-        ECIESError { inner: Box::new(source) }
+        Self { inner: Box::new(source) }
     }
 }
 

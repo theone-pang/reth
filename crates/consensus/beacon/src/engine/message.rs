@@ -1,24 +1,23 @@
-use crate::{
-    engine::{error::BeaconOnNewPayloadError, forkchoice::ForkchoiceStatus},
-    BeaconConsensusEngineEvent,
-};
+use crate::engine::{error::BeaconOnNewPayloadError, forkchoice::ForkchoiceStatus};
 use futures::{future::Either, FutureExt};
-use reth_interfaces::{consensus::ForkchoiceState, RethResult};
+use reth_engine_primitives::EngineTypes;
+use reth_errors::RethResult;
 use reth_payload_builder::error::PayloadBuilderError;
 use reth_rpc_types::engine::{
-    CancunPayloadFields, ExecutionPayload, ForkChoiceUpdateResult, ForkchoiceUpdateError,
-    ForkchoiceUpdated, PayloadAttributes, PayloadId, PayloadStatus, PayloadStatusEnum,
+    CancunPayloadFields, ExecutionPayload, ForkChoiceUpdateResult, ForkchoiceState,
+    ForkchoiceUpdateError, ForkchoiceUpdated, PayloadId, PayloadStatus, PayloadStatusEnum,
 };
 use std::{
+    fmt::Display,
     future::Future,
     pin::Pin,
     task::{ready, Context, Poll},
 };
-use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use tokio::sync::oneshot;
 
 /// Represents the outcome of forkchoice update.
 ///
-/// This is a future that resolves to [ForkChoiceUpdateResult]
+/// This is a future that resolves to [`ForkChoiceUpdateResult`]
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 #[derive(Debug)]
 pub struct OnForkChoiceUpdated {
@@ -34,13 +33,13 @@ pub struct OnForkChoiceUpdated {
 // === impl OnForkChoiceUpdated ===
 
 impl OnForkChoiceUpdated {
-    /// Returns the determined status of the received ForkchoiceState.
-    pub fn forkchoice_status(&self) -> ForkchoiceStatus {
+    /// Returns the determined status of the received `ForkchoiceState`.
+    pub const fn forkchoice_status(&self) -> ForkchoiceStatus {
         self.forkchoice_status
     }
 
     /// Creates a new instance of `OnForkChoiceUpdated` for the `SYNCING` state
-    pub(crate) fn syncing() -> Self {
+    pub fn syncing() -> Self {
         let status = PayloadStatus::from_status(PayloadStatusEnum::Syncing);
         Self {
             forkchoice_status: ForkchoiceStatus::from_payload_status(&status.status),
@@ -50,7 +49,7 @@ impl OnForkChoiceUpdated {
 
     /// Creates a new instance of `OnForkChoiceUpdated` if the forkchoice update succeeded and no
     /// payload attributes were provided.
-    pub(crate) fn valid(status: PayloadStatus) -> Self {
+    pub fn valid(status: PayloadStatus) -> Self {
         Self {
             forkchoice_status: ForkchoiceStatus::from_payload_status(&status.status),
             fut: Either::Left(futures::future::ready(Ok(ForkchoiceUpdated::new(status)))),
@@ -59,7 +58,7 @@ impl OnForkChoiceUpdated {
 
     /// Creates a new instance of `OnForkChoiceUpdated` with the given payload status, if the
     /// forkchoice update failed due to an invalid payload.
-    pub(crate) fn with_invalid(status: PayloadStatus) -> Self {
+    pub fn with_invalid(status: PayloadStatus) -> Self {
         Self {
             forkchoice_status: ForkchoiceStatus::from_payload_status(&status.status),
             fut: Either::Left(futures::future::ready(Ok(ForkchoiceUpdated::new(status)))),
@@ -68,7 +67,7 @@ impl OnForkChoiceUpdated {
 
     /// Creates a new instance of `OnForkChoiceUpdated` if the forkchoice update failed because the
     /// given state is considered invalid
-    pub(crate) fn invalid_state() -> Self {
+    pub fn invalid_state() -> Self {
         Self {
             forkchoice_status: ForkchoiceStatus::Invalid,
             fut: Either::Left(futures::future::ready(Err(ForkchoiceUpdateError::InvalidState))),
@@ -77,7 +76,7 @@ impl OnForkChoiceUpdated {
 
     /// Creates a new instance of `OnForkChoiceUpdated` if the forkchoice update was successful but
     /// payload attributes were invalid.
-    pub(crate) fn invalid_payload_attributes() -> Self {
+    pub fn invalid_payload_attributes() -> Self {
         Self {
             // This is valid because this is only reachable if the state and payload is valid
             forkchoice_status: ForkchoiceStatus::Valid,
@@ -88,7 +87,7 @@ impl OnForkChoiceUpdated {
     }
 
     /// If the forkchoice update was successful and no payload attributes were provided, this method
-    pub(crate) fn updated_with_pending_payload_id(
+    pub const fn updated_with_pending_payload_id(
         payload_status: PayloadStatus,
         pending_payload_id: oneshot::Receiver<Result<PayloadId, PayloadBuilderError>>,
     ) -> Self {
@@ -140,8 +139,7 @@ impl Future for PendingPayloadId {
 /// A message for the beacon engine from other components of the node (engine RPC API invoked by the
 /// consensus layer).
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
-pub enum BeaconEngineMessage {
+pub enum BeaconEngineMessage<Engine: EngineTypes> {
     /// Message with new payload.
     NewPayload {
         /// The execution payload received by Engine API.
@@ -156,12 +154,38 @@ pub enum BeaconEngineMessage {
         /// The updated forkchoice state.
         state: ForkchoiceState,
         /// The payload attributes for block building.
-        payload_attrs: Option<PayloadAttributes>,
+        payload_attrs: Option<Engine::PayloadAttributes>,
         /// The sender for returning forkchoice updated result.
         tx: oneshot::Sender<RethResult<OnForkChoiceUpdated>>,
     },
     /// Message with exchanged transition configuration.
     TransitionConfigurationExchanged,
-    /// Add a new listener for [`BeaconEngineMessage`].
-    EventListener(UnboundedSender<BeaconConsensusEngineEvent>),
+}
+
+impl<Engine: EngineTypes> Display for BeaconEngineMessage<Engine> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NewPayload { payload, .. } => {
+                write!(
+                    f,
+                    "NewPayload(parent: {}, number: {}, hash: {})",
+                    payload.parent_hash(),
+                    payload.block_number(),
+                    payload.block_hash()
+                )
+            }
+            Self::ForkchoiceUpdated { state, payload_attrs, .. } => {
+                // we don't want to print the entire payload attributes, because for OP this
+                // includes all txs
+                write!(
+                    f,
+                    "ForkchoiceUpdated {{ state: {state:?}, has_payload_attributes: {} }}",
+                    payload_attrs.is_some()
+                )
+            }
+            Self::TransitionConfigurationExchanged => {
+                write!(f, "TransitionConfigurationExchanged")
+            }
+        }
+    }
 }

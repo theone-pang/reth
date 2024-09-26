@@ -5,29 +5,39 @@ use crate::{
     BeaconForkChoiceUpdateError, BeaconOnNewPayloadError,
 };
 use futures::TryFutureExt;
-use reth_interfaces::RethResult;
+use reth_engine_primitives::EngineTypes;
+use reth_errors::RethResult;
 use reth_rpc_types::engine::{
-    CancunPayloadFields, ExecutionPayload, ForkchoiceState, ForkchoiceUpdated, PayloadAttributes,
-    PayloadStatus,
+    CancunPayloadFields, ExecutionPayload, ForkchoiceState, ForkchoiceUpdated, PayloadStatus,
 };
-use tokio::sync::{mpsc, mpsc::UnboundedSender, oneshot};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use reth_tokio_util::{EventSender, EventStream};
+use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
 /// A _shareable_ beacon consensus frontend type. Used to interact with the spawned beacon consensus
 /// engine task.
 ///
-/// See also [`BeaconConsensusEngine`](crate::engine::BeaconConsensusEngine).
-#[derive(Clone, Debug)]
-pub struct BeaconConsensusEngineHandle {
-    pub(crate) to_engine: UnboundedSender<BeaconEngineMessage>,
+/// See also `BeaconConsensusEngine`
+#[derive(Debug, Clone)]
+pub struct BeaconConsensusEngineHandle<Engine>
+where
+    Engine: EngineTypes,
+{
+    pub(crate) to_engine: UnboundedSender<BeaconEngineMessage<Engine>>,
+    event_sender: EventSender<BeaconConsensusEngineEvent>,
 }
 
 // === impl BeaconConsensusEngineHandle ===
 
-impl BeaconConsensusEngineHandle {
+impl<Engine> BeaconConsensusEngineHandle<Engine>
+where
+    Engine: EngineTypes,
+{
     /// Creates a new beacon consensus engine handle.
-    pub fn new(to_engine: UnboundedSender<BeaconEngineMessage>) -> Self {
-        Self { to_engine }
+    pub const fn new(
+        to_engine: UnboundedSender<BeaconEngineMessage<Engine>>,
+        event_sender: EventSender<BeaconConsensusEngineEvent>,
+    ) -> Self {
+        Self { to_engine, event_sender }
     }
 
     /// Sends a new payload message to the beacon consensus engine and waits for a response.
@@ -49,7 +59,7 @@ impl BeaconConsensusEngineHandle {
     pub async fn fork_choice_updated(
         &self,
         state: ForkchoiceState,
-        payload_attrs: Option<PayloadAttributes>,
+        payload_attrs: Option<Engine::PayloadAttributes>,
     ) -> Result<ForkchoiceUpdated, BeaconForkChoiceUpdateError> {
         Ok(self
             .send_fork_choice_updated(state, payload_attrs)
@@ -63,7 +73,7 @@ impl BeaconConsensusEngineHandle {
     fn send_fork_choice_updated(
         &self,
         state: ForkchoiceState,
-        payload_attrs: Option<PayloadAttributes>,
+        payload_attrs: Option<Engine::PayloadAttributes>,
     ) -> oneshot::Receiver<RethResult<OnForkChoiceUpdated>> {
         let (tx, rx) = oneshot::channel();
         let _ = self.to_engine.send(BeaconEngineMessage::ForkchoiceUpdated {
@@ -74,17 +84,18 @@ impl BeaconConsensusEngineHandle {
         rx
     }
 
-    /// Sends a transition configuration exchagne message to the beacon consensus engine.
+    /// Sends a transition configuration exchange message to the beacon consensus engine.
     ///
     /// See also <https://github.com/ethereum/execution-apis/blob/3d627c95a4d3510a8187dd02e0250ecb4331d27e/src/engine/paris.md#engine_exchangetransitionconfigurationv1>
-    pub async fn transition_configuration_exchanged(&self) {
+    ///
+    /// This only notifies about the exchange. The actual exchange is done by the engine API impl
+    /// itself.
+    pub fn transition_configuration_exchanged(&self) {
         let _ = self.to_engine.send(BeaconEngineMessage::TransitionConfigurationExchanged);
     }
 
     /// Creates a new [`BeaconConsensusEngineEvent`] listener stream.
-    pub fn event_listener(&self) -> UnboundedReceiverStream<BeaconConsensusEngineEvent> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let _ = self.to_engine.send(BeaconEngineMessage::EventListener(tx));
-        UnboundedReceiverStream::new(rx)
+    pub fn event_listener(&self) -> EventStream<BeaconConsensusEngineEvent> {
+        self.event_sender.new_listener()
     }
 }

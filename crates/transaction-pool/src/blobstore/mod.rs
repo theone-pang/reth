@@ -1,10 +1,15 @@
 //! Storage for blob data of EIP4844 transactions.
 
+use alloy_eips::eip4844::BlobAndProofV1;
+use alloy_primitives::B256;
 pub use disk::{DiskFileBlobStore, DiskFileBlobStoreConfig, OpenDiskFileBlobStore};
 pub use mem::InMemoryBlobStore;
 pub use noop::NoopBlobStore;
-use reth_primitives::{BlobTransactionSidecar, B256};
-use std::{fmt, sync::atomic::AtomicUsize};
+use reth_primitives::BlobTransactionSidecar;
+use std::{
+    fmt,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 pub use tracker::{BlobStoreCanonTracker, BlobStoreUpdates};
 
 pub mod disk;
@@ -31,6 +36,13 @@ pub trait BlobStore: fmt::Debug + Send + Sync + 'static {
     /// Deletes multiple blob sidecars from the store
     fn delete_all(&self, txs: Vec<B256>) -> Result<(), BlobStoreError>;
 
+    /// A maintenance function that can be called periodically to clean up the blob store, returns
+    /// the number of successfully deleted blobs and the number of failed deletions.
+    ///
+    /// This is intended to be called in the background to clean up any old or unused data, in case
+    /// the store uses deferred cleanup: [`DiskFileBlobStore`]
+    fn cleanup(&self) -> BlobStoreCleanupStat;
+
     /// Retrieves the decoded blob data for the given transaction hash.
     fn get(&self, tx: B256) -> Result<Option<BlobTransactionSidecar>, BlobStoreError>;
 
@@ -48,11 +60,17 @@ pub trait BlobStore: fmt::Debug + Send + Sync + 'static {
         txs: Vec<B256>,
     ) -> Result<Vec<(B256, BlobTransactionSidecar)>, BlobStoreError>;
 
-    /// Returns the exact [BlobTransactionSidecar] for the given transaction hashes in the exact
+    /// Returns the exact [`BlobTransactionSidecar`] for the given transaction hashes in the exact
     /// order they were requested.
     ///
     /// Returns an error if any of the blobs are not found in the blob store.
     fn get_exact(&self, txs: Vec<B256>) -> Result<Vec<BlobTransactionSidecar>, BlobStoreError>;
+
+    /// Return the [`BlobTransactionSidecar`]s for a list of blob versioned hashes.
+    fn get_by_versioned_hashes(
+        &self,
+        versioned_hashes: &[B256],
+    ) -> Result<Vec<Option<BlobAndProofV1>>, BlobStoreError>;
 
     /// Data size of all transactions in the blob store.
     fn data_size_hint(&self) -> Option<usize>;
@@ -85,40 +103,65 @@ pub(crate) struct BlobStoreSize {
 impl BlobStoreSize {
     #[inline]
     pub(crate) fn add_size(&self, add: usize) {
-        self.data_size.fetch_add(add, std::sync::atomic::Ordering::Relaxed);
+        self.data_size.fetch_add(add, Ordering::Relaxed);
     }
 
     #[inline]
     pub(crate) fn sub_size(&self, sub: usize) {
-        self.data_size.fetch_sub(sub, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.data_size.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(sub))
+        });
     }
 
     #[inline]
     pub(crate) fn update_len(&self, len: usize) {
-        self.num_blobs.store(len, std::sync::atomic::Ordering::Relaxed);
+        self.num_blobs.store(len, Ordering::Relaxed);
     }
 
     #[inline]
     pub(crate) fn inc_len(&self, add: usize) {
-        self.num_blobs.fetch_add(add, std::sync::atomic::Ordering::Relaxed);
+        self.num_blobs.fetch_add(add, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn sub_len(&self, sub: usize) {
+        let _ = self.num_blobs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(sub))
+        });
     }
 
     #[inline]
     pub(crate) fn data_size(&self) -> usize {
-        self.data_size.load(std::sync::atomic::Ordering::Relaxed)
+        self.data_size.load(Ordering::Relaxed)
     }
 
     #[inline]
     pub(crate) fn blobs_len(&self) -> usize {
-        self.num_blobs.load(std::sync::atomic::Ordering::Relaxed)
+        self.num_blobs.load(Ordering::Relaxed)
     }
+}
+
+impl PartialEq for BlobStoreSize {
+    fn eq(&self, other: &Self) -> bool {
+        self.data_size.load(Ordering::Relaxed) == other.data_size.load(Ordering::Relaxed) &&
+            self.num_blobs.load(Ordering::Relaxed) == other.num_blobs.load(Ordering::Relaxed)
+    }
+}
+
+/// Statistics for the cleanup operation.
+#[derive(Debug, Clone, Default)]
+pub struct BlobStoreCleanupStat {
+    /// the number of successfully deleted blobs
+    pub delete_succeed: usize,
+    /// the number of failed deletions
+    pub delete_failed: usize,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[allow(unused)]
+    #[allow(dead_code)]
     struct DynStore {
         store: Box<dyn BlobStore>,
     }

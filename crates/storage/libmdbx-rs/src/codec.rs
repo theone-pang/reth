@@ -1,5 +1,5 @@
 use crate::{Error, TransactionKind};
-use derive_more::*;
+use derive_more::{Debug, Deref, DerefMut};
 use std::{borrow::Cow, slice};
 
 /// Implement this to be able to decode data values
@@ -41,7 +41,7 @@ impl<'tx> TableObject for Cow<'tx, [u8]> {
 
         #[cfg(not(feature = "return-borrowed"))]
         {
-            let is_dirty = (!K::ONLY_CLEAN) &&
+            let is_dirty = (!K::IS_READ_ONLY) &&
                 crate::error::mdbx_result(ffi::mdbx_is_dirty(_txn, data_val.iov_base))?;
 
             Ok(if is_dirty { Cow::Owned(s.to_vec()) } else { Cow::Borrowed(s) })

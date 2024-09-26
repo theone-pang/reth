@@ -5,9 +5,12 @@ use crate::{
     Case, Error, Suite,
 };
 use alloy_rlp::Decodable;
-use reth_db::test_utils::create_test_rw_db;
-use reth_primitives::{BlockBody, SealedBlock};
-use reth_provider::{BlockWriter, HashingWriter, ProviderFactory};
+use rayon::iter::{ParallelBridge, ParallelIterator};
+use reth_primitives::{BlockBody, SealedBlock, StaticFileSegment};
+use reth_provider::{
+    providers::StaticFileWriter, test_utils::create_test_provider_factory_with_chain_spec,
+    DatabaseProviderFactory, HashingWriter, StaticFileProviderFactory,
+};
 use reth_stages::{stages::ExecutionStage, ExecInput, Stage};
 use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 
@@ -19,7 +22,7 @@ pub struct BlockchainTests {
 
 impl BlockchainTests {
     /// Create a new handler for a subset of the blockchain test suite.
-    pub fn new(suite: String) -> Self {
+    pub const fn new(suite: String) -> Self {
         Self { suite }
     }
 }
@@ -41,7 +44,7 @@ pub struct BlockchainTestCase {
 
 impl Case for BlockchainTestCase {
     fn load(path: &Path) -> Result<Self, Error> {
-        Ok(BlockchainTestCase {
+        Ok(Self {
             tests: {
                 let s = fs::read_to_string(path)
                     .map_err(|error| Error::Io { path: path.into(), error })?;
@@ -59,82 +62,104 @@ impl Case for BlockchainTestCase {
     fn run(&self) -> Result<(), Error> {
         // If the test is marked for skipping, return a Skipped error immediately.
         if self.skip {
-            return Err(Error::Skipped);
+            return Err(Error::Skipped)
         }
 
         // Iterate through test cases, filtering by the network type to exclude specific forks.
-        for case in self.tests.values().filter(|case| {
-            !matches!(
-                case.network,
-                ForkSpec::ByzantiumToConstantinopleAt5 |
-                    ForkSpec::Constantinople |
-                    ForkSpec::ConstantinopleFix |
-                    ForkSpec::MergeEOF |
-                    ForkSpec::MergeMeterInitCode |
-                    ForkSpec::MergePush0 |
-                    ForkSpec::Unknown
-            )
-        }) {
-            // Create a new test database and initialize a provider for the test case.
-            let db = create_test_rw_db();
-            let provider = ProviderFactory::new(db.as_ref(), Arc::new(case.network.clone().into()))
-                .provider_rw()
+        self.tests
+            .values()
+            .filter(|case| {
+                !matches!(
+                    case.network,
+                    ForkSpec::ByzantiumToConstantinopleAt5 |
+                        ForkSpec::Constantinople |
+                        ForkSpec::ConstantinopleFix |
+                        ForkSpec::MergeEOF |
+                        ForkSpec::MergeMeterInitCode |
+                        ForkSpec::MergePush0 |
+                        ForkSpec::Unknown
+                )
+            })
+            .par_bridge()
+            .try_for_each(|case| {
+                // Create a new test database and initialize a provider for the test case.
+                let provider = create_test_provider_factory_with_chain_spec(Arc::new(
+                    case.network.clone().into(),
+                ))
+                .database_provider_rw()
                 .unwrap();
 
-            // Insert initial test state into the provider.
-            provider
-                .insert_block(
+                // Insert initial test state into the provider.
+                provider.insert_historical_block(
                     SealedBlock::new(
                         case.genesis_block_header.clone().into(),
                         BlockBody::default(),
                     )
                     .try_seal_with_senders()
                     .unwrap(),
-                    None,
-                )
-                .map_err(|err| Error::RethError(err.into()))?;
-            case.pre.write_to_db(provider.tx_ref())?;
+                )?;
+                case.pre.write_to_db(provider.tx_ref())?;
 
-            // Decode and insert blocks, creating a chain of blocks for the test case.
-            let last_block = case.blocks.iter().try_fold(None, |_, block| {
-                let decoded = SealedBlock::decode(&mut block.rlp.as_ref())?;
+                // Initialize receipts static file with genesis
+                {
+                    let static_file_provider = provider.static_file_provider();
+                    let mut receipts_writer =
+                        static_file_provider.latest_writer(StaticFileSegment::Receipts).unwrap();
+                    receipts_writer.increment_block(0).unwrap();
+                    receipts_writer.commit_without_sync_all().unwrap();
+                }
+
+                // Decode and insert blocks, creating a chain of blocks for the test case.
+                let last_block = case.blocks.iter().try_fold(None, |_, block| {
+                    let decoded = SealedBlock::decode(&mut block.rlp.as_ref())?;
+                    provider.insert_historical_block(
+                        decoded.clone().try_seal_with_senders().unwrap(),
+                    )?;
+                    Ok::<Option<SealedBlock>, Error>(Some(decoded))
+                })?;
                 provider
-                    .insert_block(decoded.clone().try_seal_with_senders().unwrap(), None)
-                    .map_err(|err| Error::RethError(err.into()))?;
-                Ok::<Option<SealedBlock>, Error>(Some(decoded))
-            })?;
+                    .static_file_provider()
+                    .latest_writer(StaticFileSegment::Headers)
+                    .unwrap()
+                    .commit_without_sync_all()
+                    .unwrap();
 
-            // Execute the execution stage using the EVM processor factory for the test case
-            // network.
-            let _ = ExecutionStage::new_with_factory(reth_revm::EvmProcessorFactory::new(
-                Arc::new(case.network.clone().into()),
-            ))
-            .execute(
-                &provider,
-                ExecInput { target: last_block.as_ref().map(|b| b.number), checkpoint: None },
-            );
+                // Execute the execution stage using the EVM processor factory for the test case
+                // network.
+                let _ = ExecutionStage::new_with_executor(
+                    reth_evm_ethereum::execute::EthExecutorProvider::ethereum(Arc::new(
+                        case.network.clone().into(),
+                    )),
+                )
+                .execute(
+                    &provider,
+                    ExecInput { target: last_block.as_ref().map(|b| b.number), checkpoint: None },
+                );
 
-            // Validate the post-state for the test case.
-            match (&case.post_state, &case.post_state_hash) {
-                (Some(state), None) => {
-                    // Validate accounts in the state against the provider's database.
-                    for (&address, account) in state.iter() {
-                        account.assert_db(address, provider.tx_ref())?;
+                // Validate the post-state for the test case.
+                match (&case.post_state, &case.post_state_hash) {
+                    (Some(state), None) => {
+                        // Validate accounts in the state against the provider's database.
+                        for (&address, account) in state {
+                            account.assert_db(address, provider.tx_ref())?;
+                        }
                     }
+                    (None, Some(expected_state_root)) => {
+                        // Insert state hashes into the provider based on the expected state root.
+                        let last_block = last_block.unwrap_or_default();
+                        provider.insert_hashes(
+                            0..=last_block.number,
+                            last_block.hash(),
+                            *expected_state_root,
+                        )?;
+                    }
+                    _ => return Err(Error::MissingPostState),
                 }
-                (None, Some(expected_state_root)) => {
-                    // Insert state hashes into the provider based on the expected state root.
-                    let last_block = last_block.unwrap_or_default();
-                    provider
-                        .insert_hashes(0..=last_block.number, last_block.hash, *expected_state_root)
-                        .map_err(|err| Error::RethError(err.into()))?;
-                }
-                _ => return Err(Error::MissingPostState),
-            }
 
-            // Drop the provider without committing to the database.
-            drop(provider);
-        }
+                // Drop the provider without committing to the database.
+                drop(provider);
+                Ok(())
+            })?;
 
         Ok(())
     }
@@ -154,8 +179,9 @@ pub fn should_skip(path: &Path) -> bool {
         // funky test with `bigint 0x00` value in json :) not possible to happen on mainnet and require
         // custom json parser. https://github.com/ethereum/tests/issues/971
         | "ValueOverflow.json"
+        | "ValueOverflowParis.json"
 
-        // txbyte is of type 02 and we dont parse tx bytes for this test to fail.
+        // txbyte is of type 02 and we don't parse tx bytes for this test to fail.
         | "typeTwoBerlin.json"
 
         // Test checks if nonce overflows. We are handling this correctly but we are not parsing
@@ -166,6 +192,7 @@ pub fn should_skip(path: &Path) -> bool {
         // Test check if gas price overflows, we handle this correctly but does not match tests specific
         // exception.
         | "HighGasPrice.json"
+        | "HighGasPriceParis.json"
 
         // Skip test where basefee/accesslist/difficulty is present but it shouldn't be supported in
         // London/Berlin/TheMerge. https://github.com/ethereum/tests/blob/5b7e1ab3ffaf026d99d20b17bb30f533a2c80c8b/GeneralStateTests/stExample/eip1559.json#L130

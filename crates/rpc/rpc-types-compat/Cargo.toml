@@ -8,10 +8,22 @@ homepage.workspace = true
 repository.workspace = true
 description = "Compatibility layer for reth-primitives and ethereum RPC types"
 
+[lints]
+workspace = true
+
 [dependencies]
+# reth
 reth-primitives.workspace = true
 reth-rpc-types.workspace = true
+reth-trie-common.workspace = true
+
+# ethereum
+alloy-primitives.workspace = true
 alloy-rlp.workspace = true
+alloy-rpc-types.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [features]
-optimism = ["reth-primitives/optimism", "reth-rpc-types/optimism"]
+optimism = ["reth-primitives/optimism"]

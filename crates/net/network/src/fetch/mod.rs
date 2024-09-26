@@ -1,15 +1,9 @@
 //! Fetch data from the network.
 
-use crate::{message::BlockRequest, peers::PeersHandle};
-use futures::StreamExt;
-use reth_eth_wire::{GetBlockBodies, GetBlockHeaders};
-use reth_interfaces::p2p::{
-    error::{EthResponseValidator, PeerRequestResult, RequestError, RequestResult},
-    headers::client::HeadersRequest,
-    priority::Priority,
-};
-use reth_network_api::ReputationChangeKind;
-use reth_primitives::{BlockBody, Header, PeerId, B256};
+mod client;
+
+pub use client::FetchClient;
+
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
@@ -18,11 +12,23 @@ use std::{
     },
     task::{Context, Poll},
 };
+
+use alloy_primitives::B256;
+use futures::StreamExt;
+use reth_eth_wire::{GetBlockBodies, GetBlockHeaders};
+use reth_network_api::test_utils::PeersHandle;
+use reth_network_p2p::{
+    error::{EthResponseValidator, PeerRequestResult, RequestError, RequestResult},
+    headers::client::HeadersRequest,
+    priority::Priority,
+};
+use reth_network_peers::PeerId;
+use reth_network_types::ReputationChangeKind;
+use reth_primitives::{BlockBody, Header};
 use tokio::sync::{mpsc, mpsc::UnboundedSender, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-mod client;
-pub use client::FetchClient;
+use crate::message::BlockRequest;
 
 /// Manages data fetching operations.
 ///
@@ -77,8 +83,16 @@ impl StateFetcher {
         best_number: u64,
         timeout: Arc<AtomicU64>,
     ) {
-        self.peers
-            .insert(peer_id, Peer { state: PeerState::Idle, best_hash, best_number, timeout });
+        self.peers.insert(
+            peer_id,
+            Peer {
+                state: PeerState::Idle,
+                best_hash,
+                best_number,
+                timeout,
+                last_response_likely_bad: false,
+            },
+        );
     }
 
     /// Removes the peer from the peer list, after which it is no longer available for future
@@ -119,14 +133,29 @@ impl StateFetcher {
     }
 
     /// Returns the _next_ idle peer that's ready to accept a request,
-    /// prioritizing those with the lowest timeout/latency.
-    /// Once a peer has been yielded, it will be moved to the end of the map
-    fn next_peer(&mut self) -> Option<PeerId> {
-        self.peers
-            .iter()
-            .filter(|(_, peer)| peer.state.is_idle())
-            .min_by_key(|(_, peer)| peer.timeout())
-            .map(|(id, _)| *id)
+    /// prioritizing those with the lowest timeout/latency and those that recently responded with
+    /// adequate data.
+    fn next_best_peer(&self) -> Option<PeerId> {
+        let mut idle = self.peers.iter().filter(|(_, peer)| peer.state.is_idle());
+
+        let mut best_peer = idle.next()?;
+
+        for maybe_better in idle {
+            // replace best peer if our current best peer sent us a bad response last time
+            if best_peer.1.last_response_likely_bad && !maybe_better.1.last_response_likely_bad {
+                best_peer = maybe_better;
+                continue
+            }
+
+            // replace best peer if this peer has better rtt
+            if maybe_better.1.timeout() < best_peer.1.timeout() &&
+                !maybe_better.1.last_response_likely_bad
+            {
+                best_peer = maybe_better;
+            }
+        }
+
+        Some(*best_peer.0)
     }
 
     /// Returns the next action to return
@@ -136,9 +165,9 @@ impl StateFetcher {
             return PollAction::NoRequests
         }
 
-        let Some(peer_id) = self.next_peer() else { return PollAction::NoPeersAvailable };
+        let Some(peer_id) = self.next_best_peer() else { return PollAction::NoPeersAvailable };
 
-        let request = self.queued_requests.pop_front().expect("not empty; qed");
+        let request = self.queued_requests.pop_front().expect("not empty");
         let request = self.prepare_block_request(peer_id, request);
 
         PollAction::Ready(FetchAction::BlockRequest { peer_id, request })
@@ -225,9 +254,9 @@ impl StateFetcher {
 
     /// Called on a `GetBlockHeaders` response from a peer.
     ///
-    /// This delegates the response and returns a [BlockResponseOutcome] to either queue in a direct
-    /// followup request or get the peer reported if the response was a
-    /// [EthResponseValidator::reputation_change_err]
+    /// This delegates the response and returns a [`BlockResponseOutcome`] to either queue in a
+    /// direct followup request or get the peer reported if the response was a
+    /// [`EthResponseValidator::reputation_change_err`]
     pub(crate) fn on_block_headers_response(
         &mut self,
         peer_id: PeerId,
@@ -238,10 +267,8 @@ impl StateFetcher {
 
         let resp = self.inflight_headers_requests.remove(&peer_id);
 
-        let is_likely_bad_response = resp
-            .as_ref()
-            .map(|r| res.is_likely_bad_headers_response(&r.request))
-            .unwrap_or_default();
+        let is_likely_bad_response =
+            resp.as_ref().is_some_and(|r| res.is_likely_bad_headers_response(&r.request));
 
         if let Some(resp) = resp {
             // delegate the response
@@ -249,6 +276,9 @@ impl StateFetcher {
         }
 
         if let Some(peer) = self.peers.get_mut(&peer_id) {
+            // update the peer's response state
+            peer.last_response_likely_bad = is_likely_bad_response;
+
             // If the peer is still ready to accept new requests, we try to send a followup
             // request immediately.
             if peer.state.on_request_finished() && !is_error && !is_likely_bad_response {
@@ -268,11 +298,16 @@ impl StateFetcher {
         peer_id: PeerId,
         res: RequestResult<Vec<BlockBody>>,
     ) -> Option<BlockResponseOutcome> {
+        let is_likely_bad_response = res.as_ref().map_or(true, |bodies| bodies.is_empty());
+
         if let Some(resp) = self.inflight_bodies_requests.remove(&peer_id) {
             let _ = resp.response.send(res.map(|b| (peer_id, b).into()));
         }
         if let Some(peer) = self.peers.get_mut(&peer_id) {
-            if peer.state.on_request_finished() {
+            // update the peer's response state
+            peer.last_response_likely_bad = is_likely_bad_response;
+
+            if peer.state.on_request_finished() && !is_likely_bad_response {
                 return self.followup_request(peer_id)
             }
         }
@@ -307,6 +342,13 @@ struct Peer {
     best_number: u64,
     /// Tracks the current timeout value we use for the peer.
     timeout: Arc<AtomicU64>,
+    /// Tracks whether the peer has recently responded with a likely bad response.
+    ///
+    /// This is used to de-rank the peer if there are other peers available.
+    /// This exists because empty responses may not be penalized (e.g. when blocks near the tip are
+    /// downloaded), but we still want to avoid requesting from the same peer again if it has the
+    /// lowest timeout.
+    last_response_likely_bad: bool,
 }
 
 impl Peer {
@@ -332,8 +374,8 @@ enum PeerState {
 
 impl PeerState {
     /// Returns true if the peer is currently idle.
-    fn is_idle(&self) -> bool {
-        matches!(self, PeerState::Idle)
+    const fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
     }
 
     /// Resets the state on a received response.
@@ -342,8 +384,8 @@ impl PeerState {
     ///
     /// Returns `true` if the peer is ready for another request.
     fn on_request_finished(&mut self) -> bool {
-        if !matches!(self, PeerState::Closing) {
-            *self = PeerState::Idle;
+        if !matches!(self, Self::Closing) {
+            *self = Self::Idle;
             return true
         }
         false
@@ -355,8 +397,8 @@ impl PeerState {
 #[derive(Debug)]
 struct Request<Req, Resp> {
     /// The issued request object
-    /// TODO: this can be attached to the response in error case
-    #[allow(unused)]
+    // TODO: this can be attached to the response in error case
+    #[allow(dead_code)]
     request: Req,
     response: oneshot::Sender<Resp>,
 }
@@ -382,23 +424,24 @@ pub(crate) enum DownloadRequest {
 
 impl DownloadRequest {
     /// Returns the corresponding state for a peer that handles the request.
-    fn peer_state(&self) -> PeerState {
+    const fn peer_state(&self) -> PeerState {
         match self {
-            DownloadRequest::GetBlockHeaders { .. } => PeerState::GetBlockHeaders,
-            DownloadRequest::GetBlockBodies { .. } => PeerState::GetBlockBodies,
+            Self::GetBlockHeaders { .. } => PeerState::GetBlockHeaders,
+            Self::GetBlockBodies { .. } => PeerState::GetBlockBodies,
         }
     }
 
     /// Returns the requested priority of this request
-    fn get_priority(&self) -> &Priority {
+    const fn get_priority(&self) -> &Priority {
         match self {
-            DownloadRequest::GetBlockHeaders { priority, .. } => priority,
-            DownloadRequest::GetBlockBodies { priority, .. } => priority,
+            Self::GetBlockHeaders { priority, .. } | Self::GetBlockBodies { priority, .. } => {
+                priority
+            }
         }
     }
 
     /// Returns `true` if this request is normal priority.
-    fn is_normal_priority(&self) -> bool {
+    const fn is_normal_priority(&self) -> bool {
         self.get_priority().is_normal()
     }
 }
@@ -429,7 +472,8 @@ pub(crate) enum BlockResponseOutcome {
 mod tests {
     use super::*;
     use crate::{peers::PeersManager, PeersConfig};
-    use reth_primitives::{SealedHeader, B256, B512};
+    use alloy_primitives::B512;
+    use reth_primitives::SealedHeader;
     use std::future::poll_fn;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -462,17 +506,17 @@ mod tests {
         fetcher.new_active_peer(peer1, B256::random(), 1, Arc::new(AtomicU64::new(1)));
         fetcher.new_active_peer(peer2, B256::random(), 2, Arc::new(AtomicU64::new(1)));
 
-        let first_peer = fetcher.next_peer().unwrap();
+        let first_peer = fetcher.next_best_peer().unwrap();
         assert!(first_peer == peer1 || first_peer == peer2);
         // Pending disconnect for first_peer
         fetcher.on_pending_disconnect(&first_peer);
         // first_peer now isn't idle, so we should get other peer
-        let second_peer = fetcher.next_peer().unwrap();
+        let second_peer = fetcher.next_best_peer().unwrap();
         assert!(first_peer == peer1 || first_peer == peer2);
         assert_ne!(first_peer, second_peer);
         // without idle peers, returns None
         fetcher.on_pending_disconnect(&second_peer);
-        assert_eq!(fetcher.next_peer(), None);
+        assert_eq!(fetcher.next_best_peer(), None);
     }
 
     #[tokio::test]
@@ -491,13 +535,13 @@ mod tests {
         fetcher.new_active_peer(peer3, B256::random(), 3, Arc::new(AtomicU64::new(50)));
 
         // Must always get peer1 (lowest timeout)
-        assert_eq!(fetcher.next_peer(), Some(peer1));
-        assert_eq!(fetcher.next_peer(), Some(peer1));
+        assert_eq!(fetcher.next_best_peer(), Some(peer1));
+        assert_eq!(fetcher.next_best_peer(), Some(peer1));
         // peer2's timeout changes below peer1's
         peer2_timeout.store(10, Ordering::Relaxed);
         // Then we get peer 2 always (now lowest)
-        assert_eq!(fetcher.next_peer(), Some(peer2));
-        assert_eq!(fetcher.next_peer(), Some(peer2));
+        assert_eq!(fetcher.next_best_peer(), Some(peer2));
+        assert_eq!(fetcher.next_best_peer(), Some(peer2));
     }
 
     #[tokio::test]

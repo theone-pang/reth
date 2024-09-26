@@ -1,28 +1,3 @@
-#![allow(dead_code, unreachable_pub, missing_docs, unused_variables)]
-
-use std::{
-    collections::VecDeque,
-    fmt, io,
-    pin::Pin,
-    task::{ready, Context, Poll},
-    time::Duration,
-};
-
-use alloy_rlp::{Decodable, Encodable, Error as RlpError, EMPTY_LIST_CODE};
-use futures::{Sink, SinkExt, StreamExt};
-use pin_project::pin_project;
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-use tokio_stream::Stream;
-use tracing::{debug, trace};
-
-use reth_codecs::derive_arbitrary;
-use reth_metrics::metrics::counter;
-use reth_primitives::{
-    bytes::{Buf, BufMut, Bytes, BytesMut},
-    hex, GotExpected,
-};
-
 use crate::{
     capability::SharedCapabilities,
     disconnect::CanDisconnect,
@@ -30,6 +5,28 @@ use crate::{
     pinger::{Pinger, PingerEvent},
     DisconnectReason, HelloMessage, HelloMessageWithProtocols,
 };
+use alloy_primitives::{
+    bytes::{Buf, BufMut, Bytes, BytesMut},
+    hex,
+};
+use alloy_rlp::{Decodable, Encodable, Error as RlpError, EMPTY_LIST_CODE};
+use futures::{Sink, SinkExt, StreamExt};
+use pin_project::pin_project;
+use reth_codecs::add_arbitrary_tests;
+use reth_metrics::metrics::counter;
+use reth_primitives::GotExpected;
+use std::{
+    collections::VecDeque,
+    io,
+    pin::Pin,
+    task::{ready, Context, Poll},
+    time::Duration,
+};
+use tokio_stream::Stream;
+use tracing::{debug, trace};
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /// [`MAX_PAYLOAD_SIZE`] is the maximum size of an uncompressed message payload.
 /// This is defined in [EIP-706](https://eips.ethereum.org/EIPS/eip-706).
@@ -44,7 +41,7 @@ const MAX_P2P_MESSAGE_ID: u8 = P2PMessageID::Pong as u8;
 
 /// [`HANDSHAKE_TIMEOUT`] determines the amount of time to wait before determining that a `p2p`
 /// handshake has timed out.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// [`PING_TIMEOUT`] determines the amount of time to wait before determining that a `p2p` ping has
 /// timed out.
@@ -54,15 +51,11 @@ const PING_TIMEOUT: Duration = Duration::from_secs(15);
 /// when the peer is responsive.
 const PING_INTERVAL: Duration = Duration::from_secs(60);
 
-/// [`GRACE_PERIOD`] determines the amount of time to wait for a peer to disconnect after sending a
-/// [`P2PMessage::Disconnect`] message.
-const GRACE_PERIOD: Duration = Duration::from_secs(2);
-
 /// [`MAX_P2P_CAPACITY`] is the maximum number of messages that can be buffered to be sent in the
 /// `p2p` stream.
 ///
-/// Note: this default is rather low because it is expected that the [P2PStream] wraps an
-/// [ECIESStream](reth_ecies::stream::ECIESStream) which internally already buffers a few MB of
+/// Note: this default is rather low because it is expected that the [`P2PStream`] wraps an
+/// [`ECIESStream`](reth_ecies::stream::ECIESStream) which internally already buffers a few MB of
 /// encoded data.
 const MAX_P2P_CAPACITY: usize = 2;
 
@@ -77,12 +70,12 @@ pub struct UnauthedP2PStream<S> {
 
 impl<S> UnauthedP2PStream<S> {
     /// Create a new `UnauthedP2PStream` from a type `S` which implements `Stream` and `Sink`.
-    pub fn new(inner: S) -> Self {
+    pub const fn new(inner: S) -> Self {
         Self { inner }
     }
 
     /// Returns a reference to the inner stream.
-    pub fn inner(&self) -> &S {
+    pub const fn inner(&self) -> &S {
         &self.inner
     }
 }
@@ -100,9 +93,7 @@ where
         trace!(?hello, "sending p2p hello to peer");
 
         // send our hello message with the Sink
-        let mut raw_hello_bytes = BytesMut::new();
-        P2PMessage::Hello(hello.message()).encode(&mut raw_hello_bytes);
-        self.inner.send(raw_hello_bytes.into()).await?;
+        self.inner.send(alloy_rlp::encode(P2PMessage::Hello(hello.message())).into()).await?;
 
         let first_message_bytes = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.inner.next())
             .await
@@ -133,11 +124,11 @@ where
                 } else {
                     debug!(%reason, "Disconnected by peer during handshake");
                 };
-                counter!("p2pstream.disconnected_errors", 1);
+                counter!("p2pstream.disconnected_errors").increment(1);
                 Err(P2PStreamError::HandshakeError(P2PHandshakeError::Disconnected(reason)))
             }
             Err(err) => {
-                debug!(?err, msg=%hex::encode(&first_message_bytes), "Failed to decode first message from peer");
+                debug!(%err, msg=%hex::encode(&first_message_bytes), "Failed to decode first message from peer");
                 Err(P2PStreamError::HandshakeError(err.into()))
             }
             Ok(msg) => {
@@ -188,17 +179,17 @@ where
         &mut self,
         reason: DisconnectReason,
     ) -> Result<(), P2PStreamError> {
-        let mut buf = BytesMut::new();
-        P2PMessage::Disconnect(reason).encode(&mut buf);
         trace!(
             %reason,
             "Sending disconnect message during the handshake",
         );
-        self.inner.send(buf.freeze()).await.map_err(P2PStreamError::Io)
+        self.inner
+            .send(Bytes::from(alloy_rlp::encode(P2PMessage::Disconnect(reason))))
+            .await
+            .map_err(P2PStreamError::Io)
     }
 }
 
-#[async_trait::async_trait]
 impl<S> CanDisconnect<Bytes> for P2PStream<S>
 where
     S: Sink<Bytes, Error = io::Error> + Unpin + Send + Sync,
@@ -231,7 +222,7 @@ where
 /// This stream emits _non-empty_ Bytes that start with the normalized message id, so that the first
 /// byte of each message starts from 0. If this stream only supports a single capability, for
 /// example `eth` then the first byte of each message will match
-/// [EthMessageID](crate::types::EthMessageID).
+/// [EthMessageID](reth_eth_wire_types::message::EthMessageID).
 #[pin_project]
 #[derive(Debug)]
 pub struct P2PStream<S> {
@@ -254,7 +245,7 @@ pub struct P2PStream<S> {
     outgoing_messages: VecDeque<Bytes>,
 
     /// Maximum number of messages that we can buffer here before the [Sink] impl returns
-    /// [Poll::Pending].
+    /// [`Poll::Pending`].
     outgoing_message_buffer_capacity: usize,
 
     /// Whether this stream is currently in the process of disconnecting by sending a disconnect
@@ -280,7 +271,7 @@ impl<S> P2PStream<S> {
     }
 
     /// Returns a reference to the inner stream.
-    pub fn inner(&self) -> &S {
+    pub const fn inner(&self) -> &S {
         &self.inner
     }
 
@@ -297,7 +288,7 @@ impl<S> P2PStream<S> {
     ///
     /// This includes all the shared capabilities that were negotiated during the handshake and
     /// their offsets based on the number of messages of each capability.
-    pub fn shared_capabilities(&self) -> &SharedCapabilities {
+    pub const fn shared_capabilities(&self) -> &SharedCapabilities {
         &self.shared_capabilities
     }
 
@@ -308,24 +299,21 @@ impl<S> P2PStream<S> {
 
     /// Queues in a _snappy_ encoded [`P2PMessage::Pong`] message.
     fn send_pong(&mut self) {
-        let pong = P2PMessage::Pong;
-        let mut pong_bytes = BytesMut::with_capacity(pong.length());
-        pong.encode(&mut pong_bytes);
-        self.outgoing_messages.push_back(pong_bytes.freeze());
+        self.outgoing_messages.push_back(Bytes::from(alloy_rlp::encode(P2PMessage::Pong)));
     }
 
     /// Queues in a _snappy_ encoded [`P2PMessage::Ping`] message.
-    fn send_ping(&mut self) {
-        let ping = P2PMessage::Ping;
-        let mut ping_bytes = BytesMut::with_capacity(ping.length());
-        ping.encode(&mut ping_bytes);
-        self.outgoing_messages.push_back(ping_bytes.freeze());
+    pub fn send_ping(&mut self) {
+        self.outgoing_messages.push_back(Bytes::from(alloy_rlp::encode(P2PMessage::Ping)));
     }
 }
 
+/// Gracefully disconnects the connection by sending a disconnect message and stop reading new
+/// messages.
 pub trait DisconnectP2P {
     /// Starts to gracefully disconnect.
     fn start_disconnect(&mut self, reason: DisconnectReason) -> Result<(), P2PStreamError>;
+
     /// Returns `true` if the connection is about to disconnect.
     fn is_disconnecting(&self) -> bool;
 }
@@ -343,14 +331,14 @@ impl<S> DisconnectP2P for P2PStream<S> {
         // clear any buffered messages and queue in
         self.outgoing_messages.clear();
         let disconnect = P2PMessage::Disconnect(reason);
-        let mut buf = BytesMut::with_capacity(disconnect.length());
+        let mut buf = Vec::with_capacity(disconnect.length());
         disconnect.encode(&mut buf);
 
-        let mut compressed = BytesMut::zeroed(1 + snap::raw::max_compress_len(buf.len() - 1));
+        let mut compressed = vec![0u8; 1 + snap::raw::max_compress_len(buf.len() - 1)];
         let compressed_size =
             self.encoder.compress(&buf[1..], &mut compressed[1..]).map_err(|err| {
                 debug!(
-                    ?err,
+                    %err,
                     msg=%hex::encode(&buf[1..]),
                     "error compressing disconnect"
                 );
@@ -365,7 +353,7 @@ impl<S> DisconnectP2P for P2PStream<S> {
         // message
         compressed[0] = buf[0];
 
-        self.outgoing_messages.push_back(compressed.freeze());
+        self.outgoing_messages.push_back(compressed.into());
         self.disconnecting = true;
         Ok(())
     }
@@ -419,6 +407,28 @@ where
                 return Poll::Ready(Some(Err(P2PStreamError::EmptyProtocolMessage)))
             }
 
+            // first decode disconnect reasons, because they can be encoded in a variety of forms
+            // over the wire, in both snappy compressed and uncompressed forms.
+            //
+            // see: [crate::disconnect::tests::test_decode_known_reasons]
+            let id = bytes[0];
+            if id == P2PMessageID::Disconnect as u8 {
+                // We can't handle the error here because disconnect reasons are encoded as both:
+                // * snappy compressed, AND
+                // * uncompressed
+                // over the network.
+                //
+                // If the decoding succeeds, we already checked the id and know this is a
+                // disconnect message, so we can return with the reason.
+                //
+                // If the decoding fails, we continue, and will attempt to decode it again if the
+                // message is snappy compressed. Failure handling in that step is the primary point
+                // where an error is returned if the disconnect reason is malformed.
+                if let Ok(reason) = DisconnectReason::decode(&mut &bytes[1..]) {
+                    return Poll::Ready(Some(Err(P2PStreamError::Disconnected(reason))))
+                }
+            }
+
             // first check that the compressed message length does not exceed the max
             // payload size
             let decompressed_len = snap::raw::decompress_len(&bytes[1..])?;
@@ -437,14 +447,13 @@ where
             // to decompress the message before we can decode it.
             this.decoder.decompress(&bytes[1..], &mut decompress_buf[1..]).map_err(|err| {
                 debug!(
-                    ?err,
+                    %err,
                     msg=%hex::encode(&bytes[1..]),
                     "error decompressing p2p message"
                 );
                 err
             })?;
 
-            let id = bytes[0];
             match id {
                 _ if id == P2PMessageID::Ping as u8 => {
                     trace!("Received Ping, Sending Pong");
@@ -452,15 +461,6 @@ where
                     // This is required because the `Sink` may not be polled externally, and if
                     // that happens, the pong will never be sent.
                     cx.waker().wake_by_ref();
-                }
-                _ if id == P2PMessageID::Disconnect as u8 => {
-                    let reason = DisconnectReason::decode(&mut &decompress_buf[1..]).map_err(|err| {
-                        debug!(
-                            ?err, msg=%hex::encode(&decompress_buf[1..]), "Failed to decode disconnect message from peer"
-                        );
-                        err
-                    })?;
-                    return Poll::Ready(Some(Err(P2PStreamError::Disconnected(reason))))
                 }
                 _ if id == P2PMessageID::Hello as u8 => {
                     // we have received a hello message outside of the handshake, so we will return
@@ -472,6 +472,19 @@ where
                 _ if id == P2PMessageID::Pong as u8 => {
                     // if we were waiting for a pong, this will reset the pinger state
                     this.pinger.on_pong()?
+                }
+                _ if id == P2PMessageID::Disconnect as u8 => {
+                    // At this point, the `decompress_buf` contains the snappy decompressed
+                    // disconnect message.
+                    //
+                    // It's possible we already tried to RLP decode this, but it was snappy
+                    // compressed, so we need to RLP decode it again.
+                    let reason = DisconnectReason::decode(&mut &decompress_buf[1..]).inspect_err(|err| {
+                        debug!(
+                            %err, msg=%hex::encode(&decompress_buf[1..]), "Failed to decode disconnect message from peer"
+                        );
+                    })?;
+                    return Poll::Ready(Some(Err(P2PStreamError::Disconnected(reason))))
                 }
                 _ if id > MAX_P2P_MESSAGE_ID && id <= MAX_RESERVED_MESSAGE_ID => {
                     // we have received an unknown reserved message
@@ -556,6 +569,18 @@ where
     }
 
     fn start_send(self: Pin<&mut Self>, item: Bytes) -> Result<(), Self::Error> {
+        if item.len() > MAX_PAYLOAD_SIZE {
+            return Err(P2PStreamError::MessageTooBig {
+                message_size: item.len(),
+                max_size: MAX_PAYLOAD_SIZE,
+            })
+        }
+
+        if item.is_empty() {
+            // empty messages are not allowed
+            return Err(P2PStreamError::EmptyProtocolMessage)
+        }
+
         // ensure we have free capacity
         if !self.has_outgoing_capacity() {
             return Err(P2PStreamError::SendBufferFull)
@@ -567,7 +592,7 @@ where
         let compressed_size =
             this.encoder.compress(&item[1..], &mut compressed[1..]).map_err(|err| {
                 debug!(
-                    ?err,
+                    %err,
                     msg=%hex::encode(&item[1..]),
                     "error compressing p2p message"
                 );
@@ -589,19 +614,24 @@ where
     /// Returns `Poll::Ready(Ok(()))` when no buffered items remain.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let mut this = self.project();
-        loop {
-            match ready!(this.inner.as_mut().poll_flush(cx)) {
-                Err(err) => return Poll::Ready(Err(err.into())),
-                Ok(()) => {
+        let poll_res = loop {
+            match this.inner.as_mut().poll_ready(cx) {
+                Poll::Pending => break Poll::Pending,
+                Poll::Ready(Err(err)) => break Poll::Ready(Err(err.into())),
+                Poll::Ready(Ok(())) => {
                     let Some(message) = this.outgoing_messages.pop_front() else {
-                        return Poll::Ready(Ok(()))
+                        break Poll::Ready(Ok(()))
                     };
                     if let Err(err) = this.inner.as_mut().start_send(message) {
-                        return Poll::Ready(Err(err.into()))
+                        break Poll::Ready(Err(err.into()))
                     }
                 }
             }
-        }
+        };
+
+        ready!(this.inner.as_mut().poll_flush(cx))?;
+
+        poll_res
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -613,9 +643,10 @@ where
 }
 
 /// This represents only the reserved `p2p` subprotocol messages.
-#[derive_arbitrary(rlp)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
+#[add_arbitrary_tests(rlp)]
 pub enum P2PMessage {
     /// The first packet sent over the connection, and sent once by both sides.
     Hello(HelloMessage),
@@ -633,33 +664,33 @@ pub enum P2PMessage {
 
 impl P2PMessage {
     /// Gets the [`P2PMessageID`] for the given message.
-    pub fn message_id(&self) -> P2PMessageID {
+    pub const fn message_id(&self) -> P2PMessageID {
         match self {
-            P2PMessage::Hello(_) => P2PMessageID::Hello,
-            P2PMessage::Disconnect(_) => P2PMessageID::Disconnect,
-            P2PMessage::Ping => P2PMessageID::Ping,
-            P2PMessage::Pong => P2PMessageID::Pong,
+            Self::Hello(_) => P2PMessageID::Hello,
+            Self::Disconnect(_) => P2PMessageID::Disconnect,
+            Self::Ping => P2PMessageID::Ping,
+            Self::Pong => P2PMessageID::Pong,
         }
     }
 }
 
-/// The [`Encodable`] implementation for [`P2PMessage::Ping`] and [`P2PMessage::Pong`] encodes the
-/// message as RLP, and prepends a snappy header to the RLP bytes for all variants except the
-/// [`P2PMessage::Hello`] variant, because the hello message is never compressed in the `p2p`
-/// subprotocol.
 impl Encodable for P2PMessage {
+    /// The [`Encodable`] implementation for [`P2PMessage::Ping`] and [`P2PMessage::Pong`] encodes
+    /// the message as RLP, and prepends a snappy header to the RLP bytes for all variants except
+    /// the [`P2PMessage::Hello`] variant, because the hello message is never compressed in the
+    /// `p2p` subprotocol.
     fn encode(&self, out: &mut dyn BufMut) {
         (self.message_id() as u8).encode(out);
         match self {
-            P2PMessage::Hello(msg) => msg.encode(out),
-            P2PMessage::Disconnect(msg) => msg.encode(out),
-            P2PMessage::Ping => {
+            Self::Hello(msg) => msg.encode(out),
+            Self::Disconnect(msg) => msg.encode(out),
+            Self::Ping => {
                 // Ping payload is _always_ snappy encoded
                 out.put_u8(0x01);
                 out.put_u8(0x00);
                 out.put_u8(EMPTY_LIST_CODE);
             }
-            P2PMessage::Pong => {
+            Self::Pong => {
                 // Pong payload is _always_ snappy encoded
                 out.put_u8(0x01);
                 out.put_u8(0x00);
@@ -670,23 +701,22 @@ impl Encodable for P2PMessage {
 
     fn length(&self) -> usize {
         let payload_len = match self {
-            P2PMessage::Hello(msg) => msg.length(),
-            P2PMessage::Disconnect(msg) => msg.length(),
+            Self::Hello(msg) => msg.length(),
+            Self::Disconnect(msg) => msg.length(),
             // id + snappy encoded payload
-            P2PMessage::Ping => 3, // len([0x01, 0x00, 0xc0]) = 3
-            P2PMessage::Pong => 3, // len([0x01, 0x00, 0xc0]) = 3
+            Self::Ping | Self::Pong => 3, // len([0x01, 0x00, 0xc0]) = 3
         };
         payload_len + 1 // (1 for length of p2p message id)
     }
 }
 
-/// The [`Decodable`] implementation for [`P2PMessage`] assumes that each of the message variants
-/// are snappy compressed, except for the [`P2PMessage::Hello`] variant since the hello message is
-/// never compressed in the `p2p` subprotocol.
-///
-/// The [`Decodable`] implementation for [`P2PMessage::Ping`] and [`P2PMessage::Pong`] expects a
-/// snappy encoded payload, see [`Encodable`] implementation.
 impl Decodable for P2PMessage {
+    /// The [`Decodable`] implementation for [`P2PMessage`] assumes that each of the message
+    /// variants are snappy compressed, except for the [`P2PMessage::Hello`] variant since the
+    /// hello message is never compressed in the `p2p` subprotocol.
+    ///
+    /// The [`Decodable`] implementation for [`P2PMessage::Ping`] and [`P2PMessage::Pong`] expects
+    /// a snappy encoded payload, see [`Encodable`] implementation.
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
         /// Removes the snappy prefix from the Ping/Pong buffer
         fn advance_snappy_ping_pong_payload(buf: &mut &[u8]) -> alloy_rlp::Result<()> {
@@ -705,15 +735,15 @@ impl Decodable for P2PMessage {
             .or(Err(RlpError::Custom("unknown p2p message id")))?;
         buf.advance(1);
         match id {
-            P2PMessageID::Hello => Ok(P2PMessage::Hello(HelloMessage::decode(buf)?)),
-            P2PMessageID::Disconnect => Ok(P2PMessage::Disconnect(DisconnectReason::decode(buf)?)),
+            P2PMessageID::Hello => Ok(Self::Hello(HelloMessage::decode(buf)?)),
+            P2PMessageID::Disconnect => Ok(Self::Disconnect(DisconnectReason::decode(buf)?)),
             P2PMessageID::Ping => {
                 advance_snappy_ping_pong_payload(buf)?;
-                Ok(P2PMessage::Ping)
+                Ok(Self::Ping)
             }
             P2PMessageID::Pong => {
                 advance_snappy_ping_pong_payload(buf)?;
-                Ok(P2PMessage::Pong)
+                Ok(Self::Pong)
             }
         }
     }
@@ -738,10 +768,10 @@ pub enum P2PMessageID {
 impl From<P2PMessage> for P2PMessageID {
     fn from(msg: P2PMessage) -> Self {
         match msg {
-            P2PMessage::Hello(_) => P2PMessageID::Hello,
-            P2PMessage::Disconnect(_) => P2PMessageID::Disconnect,
-            P2PMessage::Ping => P2PMessageID::Ping,
-            P2PMessage::Pong => P2PMessageID::Pong,
+            P2PMessage::Hello(_) => Self::Hello,
+            P2PMessage::Disconnect(_) => Self::Disconnect,
+            P2PMessage::Ping => Self::Ping,
+            P2PMessage::Pong => Self::Pong,
         }
     }
 }
@@ -751,50 +781,11 @@ impl TryFrom<u8> for P2PMessageID {
 
     fn try_from(id: u8) -> Result<Self, Self::Error> {
         match id {
-            0x00 => Ok(P2PMessageID::Hello),
-            0x01 => Ok(P2PMessageID::Disconnect),
-            0x02 => Ok(P2PMessageID::Ping),
-            0x03 => Ok(P2PMessageID::Pong),
+            0x00 => Ok(Self::Hello),
+            0x01 => Ok(Self::Disconnect),
+            0x02 => Ok(Self::Ping),
+            0x03 => Ok(Self::Pong),
             _ => Err(P2PStreamError::UnknownReservedMessageId(id)),
-        }
-    }
-}
-
-/// RLPx `p2p` protocol version
-#[derive_arbitrary(rlp)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub enum ProtocolVersion {
-    /// `p2p` version 4
-    V4 = 4,
-    /// `p2p` version 5
-    #[default]
-    V5 = 5,
-}
-
-impl fmt::Display for ProtocolVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "v{}", *self as u8)
-    }
-}
-
-impl Encodable for ProtocolVersion {
-    fn encode(&self, out: &mut dyn BufMut) {
-        (*self as u8).encode(out)
-    }
-    fn length(&self) -> usize {
-        // the version should be a single byte
-        (*self as u8).length()
-    }
-}
-
-impl Decodable for ProtocolVersion {
-    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
-        let version = u8::decode(buf)?;
-        match version {
-            4 => Ok(ProtocolVersion::V4),
-            5 => Ok(ProtocolVersion::V5),
-            _ => Err(RlpError::Custom("unknown p2p protocol version")),
         }
     }
 }
@@ -802,9 +793,7 @@ impl Decodable for ProtocolVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        capability::SharedCapability, test_utils::eth_hello, DisconnectReason, EthVersion,
-    };
+    use crate::{capability::SharedCapability, test_utils::eth_hello, EthVersion, ProtocolVersion};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_util::codec::Decoder;
 
@@ -842,6 +831,53 @@ mod tests {
             P2PStreamError::Disconnected(reason) => assert_eq!(reason, expected_disconnect),
             e => panic!("unexpected err: {e}"),
         }
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_can_disconnect_weird_disconnect_encoding() {
+        reth_tracing::init_test_tracing();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+
+        let expected_disconnect = DisconnectReason::SubprotocolSpecific;
+
+        let handle = tokio::spawn(async move {
+            // roughly based off of the design of tokio::net::TcpListener
+            let (incoming, _) = listener.accept().await.unwrap();
+            let stream = crate::PassthroughCodec::default().framed(incoming);
+
+            let (server_hello, _) = eth_hello();
+
+            let (mut p2p_stream, _) =
+                UnauthedP2PStream::new(stream).handshake(server_hello).await.unwrap();
+
+            // Unrolled `disconnect` method, without compression
+            p2p_stream.outgoing_messages.clear();
+
+            p2p_stream.outgoing_messages.push_back(Bytes::from(alloy_rlp::encode(
+                P2PMessage::Disconnect(DisconnectReason::SubprotocolSpecific),
+            )));
+            p2p_stream.disconnecting = true;
+            p2p_stream.close().await.unwrap();
+        });
+
+        let outgoing = TcpStream::connect(local_addr).await.unwrap();
+        let sink = crate::PassthroughCodec::default().framed(outgoing);
+
+        let (client_hello, _) = eth_hello();
+
+        let (mut p2p_stream, _) =
+            UnauthedP2PStream::new(sink).handshake(client_hello).await.unwrap();
+
+        let err = p2p_stream.next().await.unwrap().unwrap_err();
+        match err {
+            P2PStreamError::Disconnected(reason) => assert_eq!(reason, expected_disconnect),
+            e => panic!("unexpected err: {e}"),
+        }
+
+        handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -952,10 +988,7 @@ mod tests {
         let snappy_ping = b"\x02\x01\0\xc0";
         let ping = P2PMessage::decode(&mut &snappy_ping[..]).unwrap();
         assert!(matches!(ping, P2PMessage::Ping));
-
-        let mut buf = BytesMut::with_capacity(ping.length());
-        ping.encode(&mut buf);
-        assert_eq!(buf.as_ref(), &snappy_ping[..]);
+        assert_eq!(alloy_rlp::encode(ping), &snappy_ping[..]);
     }
 
     #[test]
@@ -963,9 +996,6 @@ mod tests {
         let snappy_pong = b"\x03\x01\0\xc0";
         let pong = P2PMessage::decode(&mut &snappy_pong[..]).unwrap();
         assert!(matches!(pong, P2PMessage::Pong));
-
-        let mut buf = BytesMut::with_capacity(pong.length());
-        pong.encode(&mut buf);
-        assert_eq!(buf.as_ref(), &snappy_pong[..]);
+        assert_eq!(alloy_rlp::encode(pong), &snappy_pong[..]);
     }
 }

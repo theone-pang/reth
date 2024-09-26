@@ -1,29 +1,36 @@
 //! Consensus management for the p2p network.
 
-use crate::{manager::NetworkEvent, message::PeerRequestSender, NetworkEvents, NetworkHandle};
+use crate::{
+    budget::{
+        DEFAULT_BUDGET_TRY_DRAIN_NETWORK_CONSENSUS_EVENTS,
+        DEFAULT_BUDGET_TRY_DRAIN_PENDING_CONSENSUS_IMPORTS, DEFAULT_BUDGET_TRY_DRAIN_STREAM,
+    },
+    metered_poll_nested_stream_with_budget, NetworkHandle,
+};
 use futures::{Future, StreamExt};
-use reth_eth_wire::{ClayerConsensusMsg, EthVersion};
-use reth_interfaces::clayer::ClayerConsensusMessageAgentTrait;
-use reth_rpc_types::PeerId;
+use reth_eth_wire::{ClayerConsensusMessageAgentTrait, ClayerConsensusMsg, EthVersion};
+use reth_network_api::{NetworkEvent, NetworkEventListenerProvider, PeerRequestSender};
+use reth_network_peers::PeerId;
+use reth_tokio_util::EventStream;
 use std::{
     collections::HashMap,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
-use tracing::debug;
 
 /// Manages consensus on top of the p2p network.
 #[derive(Debug)]
-pub struct NetworkClayerManager<Consensus> {
+pub struct NetworkClayerManager<ConsensusAgent> {
     /// Consensus layer.
-    clayer: Consensus,
+    clayer: ConsensusAgent,
     /// Network access.
     network: NetworkHandle,
     /// From which we get all new incoming transaction related messages.
-    network_events: UnboundedReceiverStream<NetworkEvent>,
+    network_events: EventStream<NetworkEvent>,
     /// All the connected peers.
     peers: HashMap<PeerId, ConsensusPeer>,
     /// Incoming events from the [`NetworkManager`](crate::NetworkManager).
@@ -32,20 +39,20 @@ pub struct NetworkClayerManager<Consensus> {
     pending_consensuses: ReceiverStream<(Vec<PeerId>, reth_primitives::Bytes)>,
 }
 
-impl<Consensus: ClayerConsensusMessageAgentTrait> NetworkClayerManager<Consensus> {
+impl<ConsensusAgent: ClayerConsensusMessageAgentTrait> NetworkClayerManager<ConsensusAgent> {
     /// Sets up a new instance.
     ///
     /// Note: This expects an existing [`NetworkManager`](crate::NetworkManager) instance.
     pub fn new(
         network: NetworkHandle,
-        clayer: Consensus,
+        clayer: ConsensusAgent,
         from_network: mpsc::UnboundedReceiver<NetworkConsensusEvent>,
     ) -> Self {
         let network_events = network.event_listener();
 
         // install a listener for new pending consensus that are allowed to be propagated over
         // the network
-        let pending = clayer.pending_consensus_listener();
+        let pending = clayer.outgoing_consensus_channel();
 
         Self {
             clayer,
@@ -58,9 +65,9 @@ impl<Consensus: ClayerConsensusMessageAgentTrait> NetworkClayerManager<Consensus
     }
 }
 
-impl<Consensus> NetworkClayerManager<Consensus>
+impl<ConsensusAgent> NetworkClayerManager<ConsensusAgent>
 where
-    Consensus: ClayerConsensusMessageAgentTrait + 'static,
+    ConsensusAgent: ClayerConsensusMessageAgentTrait + 'static,
 {
     fn on_network_event(&mut self, event: NetworkEvent) {
         match event {
@@ -86,8 +93,7 @@ where
     fn on_network_consensus_event(&mut self, event: NetworkConsensusEvent) {
         match event {
             NetworkConsensusEvent::IncomingConsensus { peer_id, msg } => {
-                debug!(target: "net::consensus", ?peer_id, "received consensus broadcast");
-                self.clayer.push_received_cache(peer_id, msg.0.clone());
+                self.clayer.push_incoming_msg(peer_id, msg.0.clone());
             }
         }
     }
@@ -108,27 +114,51 @@ where
 /// An endless future.
 ///
 /// This should be spawned or used as part of `tokio::select!`.
-impl<Consensus> Future for NetworkClayerManager<Consensus>
+impl<ConsensusAgent> Future for NetworkClayerManager<ConsensusAgent>
 where
-    Consensus: ClayerConsensusMessageAgentTrait + Unpin + 'static,
+    ConsensusAgent: ClayerConsensusMessageAgentTrait + Unpin + 'static,
 {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        // drain network/peer related events
-        while let Poll::Ready(Some(event)) = this.network_events.poll_next_unpin(cx) {
-            this.on_network_event(event);
-        }
+        let mut consensus_durations = ConsensusManagerPollDurations::default();
 
-        // drain incoming transaction events
-        while let Poll::Ready(Some(event)) = this.consensus_events.poll_next_unpin(cx) {
-            this.on_network_consensus_event(event);
-        }
+        let maybe_more_network_events = metered_poll_nested_stream_with_budget!(
+            consensus_durations.acc_network_events,
+            "net::consensus",
+            "Network events stream",
+            DEFAULT_BUDGET_TRY_DRAIN_STREAM,
+            this.network_events.poll_next_unpin(cx),
+            |event| this.on_network_event(event)
+        );
 
-        while let Poll::Ready(Some((peers, data))) = this.pending_consensuses.poll_next_unpin(cx) {
-            this.propagate_consensus(peers, data);
+        let maybe_more_consensus_events = metered_poll_nested_stream_with_budget!(
+            consensus_durations.acc_consensus_events,
+            "net::consensus",
+            "Network transaction events stream",
+            DEFAULT_BUDGET_TRY_DRAIN_NETWORK_CONSENSUS_EVENTS,
+            this.consensus_events.poll_next_unpin(cx),
+            |event| this.on_network_consensus_event(event),
+        );
+
+        let maybe_more_pending_consensuses = metered_poll_nested_stream_with_budget!(
+            consensus_durations.acc_pending_imports,
+            "net::consensus",
+            "Pending consensuses stream",
+            DEFAULT_BUDGET_TRY_DRAIN_PENDING_CONSENSUS_IMPORTS,
+            this.pending_consensuses.poll_next_unpin(cx),
+            |(peers, data)| this.propagate_consensus(peers, data)
+        );
+
+        if maybe_more_network_events
+            || maybe_more_consensus_events
+            || maybe_more_pending_consensuses
+        {
+            // make sure we're woken up again
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
         }
 
         Poll::Pending
@@ -157,4 +187,11 @@ struct ConsensusPeer {
     /// The peer's client version.
     #[allow(unused)]
     client_version: Arc<str>,
+}
+
+#[derive(Debug, Default)]
+struct ConsensusManagerPollDurations {
+    acc_network_events: Duration,
+    acc_pending_imports: Duration,
+    acc_consensus_events: Duration,
 }

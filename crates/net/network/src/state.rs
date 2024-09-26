@@ -1,38 +1,62 @@
 //! Keeps track of the state of the network.
 
-use crate::{
-    cache::LruCache,
-    discovery::{Discovery, DiscoveryEvent},
-    fetch::{BlockResponseOutcome, FetchAction, StateFetcher},
-    manager::DiscoveredEvent,
-    message::{
-        BlockRequest, NewBlockMessage, PeerRequest, PeerRequestSender, PeerResponse,
-        PeerResponseResult,
-    },
-    peers::{PeerAction, PeersManager},
-    FetchClient,
-};
-use reth_eth_wire::{
-    capability::Capabilities, BlockHashNumber, DisconnectReason, NewBlockHashes, Status,
-};
-use reth_network_api::PeerKind;
-use reth_primitives::{ForkId, PeerId, B256};
-use reth_provider::BlockNumReader;
 use std::{
     collections::{HashMap, VecDeque},
+    fmt,
     net::{IpAddr, SocketAddr},
-    num::NonZeroUsize,
+    ops::Deref,
     sync::{
         atomic::{AtomicU64, AtomicUsize},
         Arc,
     },
     task::{Context, Poll},
 };
+
+use alloy_primitives::B256;
+use rand::seq::SliceRandom;
+use reth_eth_wire::{BlockHashNumber, Capabilities, DisconnectReason, NewBlockHashes, Status};
+use reth_network_api::{DiscoveredEvent, DiscoveryEvent, PeerRequest, PeerRequestSender};
+use reth_network_peers::PeerId;
+use reth_network_types::{PeerAddr, PeerKind};
+use reth_primitives::ForkId;
 use tokio::sync::oneshot;
 use tracing::{debug, trace};
 
+use crate::{
+    cache::LruCache,
+    discovery::Discovery,
+    fetch::{BlockResponseOutcome, FetchAction, StateFetcher},
+    message::{BlockRequest, NewBlockMessage, PeerResponse, PeerResponseResult},
+    peers::{PeerAction, PeersManager},
+    FetchClient,
+};
+
 /// Cache limit of blocks to keep track of for a single peer.
-const PEER_BLOCK_CACHE_LIMIT: usize = 512;
+const PEER_BLOCK_CACHE_LIMIT: u32 = 512;
+
+/// Wrapper type for the [`BlockNumReader`] trait.
+pub(crate) struct BlockNumReader(Box<dyn reth_storage_api::BlockNumReader>);
+
+impl BlockNumReader {
+    /// Create a new instance with the given reader.
+    pub fn new(reader: impl reth_storage_api::BlockNumReader + 'static) -> Self {
+        Self(Box::new(reader))
+    }
+}
+
+impl fmt::Debug for BlockNumReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BlockNumReader").field("inner", &"<dyn BlockNumReader>").finish()
+    }
+}
+
+impl Deref for BlockNumReader {
+    type Target = Box<dyn reth_storage_api::BlockNumReader>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 /// The [`NetworkState`] keeps track of the state of all peers in the network.
 ///
@@ -45,7 +69,7 @@ const PEER_BLOCK_CACHE_LIMIT: usize = 512;
 ///
 /// This type is also responsible for responding for received request.
 #[derive(Debug)]
-pub struct NetworkState<C> {
+pub struct NetworkState {
     /// All active peers and their state.
     active_peers: HashMap<PeerId, ActivePeer>,
     /// Manages connections to peers.
@@ -56,28 +80,23 @@ pub struct NetworkState<C> {
     ///
     /// This type is used to fetch the block number after we established a session and received the
     /// [Status] block hash.
-    client: C,
+    client: BlockNumReader,
     /// Network discovery.
     discovery: Discovery,
-    /// The genesis hash of the network we're on
-    genesis_hash: B256,
     /// The type that handles requests.
     ///
-    /// The fetcher streams RLPx related requests on a per-peer basis to this type. This type will
-    /// then queue in the request and notify the fetcher once the result has been received.
+    /// The fetcher streams `RLPx` related requests on a per-peer basis to this type. This type
+    /// will then queue in the request and notify the fetcher once the result has been
+    /// received.
     state_fetcher: StateFetcher,
 }
 
-impl<C> NetworkState<C>
-where
-    C: BlockNumReader,
-{
+impl NetworkState {
     /// Create a new state instance with the given params
     pub(crate) fn new(
-        client: C,
+        client: BlockNumReader,
         discovery: Discovery,
         peers_manager: PeersManager,
-        genesis_hash: B256,
         num_active_peers: Arc<AtomicUsize>,
     ) -> Self {
         let state_fetcher = StateFetcher::new(peers_manager.handle(), num_active_peers);
@@ -87,7 +106,6 @@ where
             queued_messages: Default::default(),
             client,
             discovery,
-            genesis_hash,
             state_fetcher,
         }
     }
@@ -103,18 +121,13 @@ where
     }
 
     /// Returns access to the [`PeersManager`]
-    pub(crate) fn peers(&self) -> &PeersManager {
+    pub(crate) const fn peers(&self) -> &PeersManager {
         &self.peers_manager
     }
 
     /// Returns a new [`FetchClient`]
     pub(crate) fn fetch_client(&self) -> FetchClient {
         self.state_fetcher.client()
-    }
-
-    /// Configured genesis hash.
-    pub fn genesis_hash(&self) -> B256 {
-        self.genesis_hash
     }
 
     /// How many peers we're currently connected to.
@@ -148,7 +161,7 @@ where
                 capabilities,
                 request_tx,
                 pending_response: None,
-                blocks: LruCache::new(NonZeroUsize::new(PEER_BLOCK_CACHE_LIMIT).unwrap()),
+                blocks: LruCache::new(PEER_BLOCK_CACHE_LIMIT),
             },
         );
     }
@@ -170,13 +183,18 @@ where
     ///
     /// See also <https://github.com/ethereum/devp2p/blob/master/caps/eth.md>
     pub(crate) fn announce_new_block(&mut self, msg: NewBlockMessage) {
-        // send a `NewBlock` message to a fraction fo the connected peers (square root of the total
+        // send a `NewBlock` message to a fraction of the connected peers (square root of the total
         // number of peers)
         let num_propagate = (self.active_peers.len() as f64).sqrt() as u64 + 1;
 
         let number = msg.block.block.header.number;
         let mut count = 0;
-        for (peer_id, peer) in self.active_peers.iter_mut() {
+
+        // Shuffle to propagate to a random sample of peers on every block announcement
+        let mut peers: Vec<_> = self.active_peers.iter_mut().collect();
+        peers.shuffle(&mut rand::thread_rng());
+
+        for (peer_id, peer) in peers {
             if peer.blocks.contains(&msg.hash) {
                 // skip peers which already reported the block
                 continue
@@ -209,7 +227,7 @@ where
     pub(crate) fn announce_new_block_hash(&mut self, msg: NewBlockMessage) {
         let number = msg.block.block.header.number;
         let hashes = NewBlockHashes(vec![BlockHashNumber { hash: msg.hash, number }]);
-        for (peer_id, peer) in self.active_peers.iter_mut() {
+        for (peer_id, peer) in &mut self.active_peers {
             if peer.blocks.contains(&msg.hash) {
                 // skip peers which already reported the block
                 continue
@@ -235,7 +253,7 @@ where
     }
 
     /// Invoked when a new [`ForkId`] is activated.
-    pub(crate) fn update_fork_id(&mut self, fork_id: ForkId) {
+    pub(crate) fn update_fork_id(&self, fork_id: ForkId) {
         self.discovery.update_fork_id(fork_id)
     }
 
@@ -269,14 +287,25 @@ where
         self.discovery.ban(peer_id, ip)
     }
 
+    /// Marks the given peer as trusted.
+    pub(crate) fn add_trusted_peer_id(&mut self, peer_id: PeerId) {
+        self.peers_manager.add_trusted_peer_id(peer_id)
+    }
+
     /// Adds a peer and its address with the given kind to the peerset.
-    pub(crate) fn add_peer_kind(&mut self, peer_id: PeerId, kind: PeerKind, addr: SocketAddr) {
+    pub(crate) fn add_peer_kind(&mut self, peer_id: PeerId, kind: PeerKind, addr: PeerAddr) {
         self.peers_manager.add_peer_kind(peer_id, kind, addr, None)
     }
 
-    pub(crate) fn remove_peer(&mut self, peer_id: PeerId, kind: PeerKind) {
+    /// Connects a peer and its address with the given kind
+    pub(crate) fn add_and_connect(&mut self, peer_id: PeerId, kind: PeerKind, addr: PeerAddr) {
+        self.peers_manager.add_and_connect_kind(peer_id, kind, addr, None)
+    }
+
+    /// Removes a peer and its address with the given kind from the peerset.
+    pub(crate) fn remove_peer_kind(&mut self, peer_id: PeerId, kind: PeerKind) {
         match kind {
-            PeerKind::Basic => self.peers_manager.remove_peer(peer_id),
+            PeerKind::Basic | PeerKind::Static => self.peers_manager.remove_peer(peer_id),
             PeerKind::Trusted => self.peers_manager.remove_peer_from_trusted_set(peer_id),
         }
     }
@@ -284,14 +313,10 @@ where
     /// Event hook for events received from the discovery service.
     fn on_discovery_event(&mut self, event: DiscoveryEvent) {
         match event {
-            DiscoveryEvent::NewNode(DiscoveredEvent::EventQueued {
-                peer_id,
-                socket_addr,
-                fork_id,
-            }) => {
+            DiscoveryEvent::NewNode(DiscoveredEvent::EventQueued { peer_id, addr, fork_id }) => {
                 self.queued_messages.push_back(StateAction::DiscoveredNode {
                     peer_id,
-                    socket_addr,
+                    addr,
                     fork_id,
                 });
             }
@@ -312,7 +337,8 @@ where
                 self.state_fetcher.on_pending_disconnect(&peer_id);
                 self.queued_messages.push_back(StateAction::Disconnect { peer_id, reason });
             }
-            PeerAction::DisconnectBannedIncoming { peer_id } => {
+            PeerAction::DisconnectBannedIncoming { peer_id } |
+            PeerAction::DisconnectUntrustedIncoming { peer_id } => {
                 self.state_fetcher.on_pending_disconnect(&peer_id);
                 self.queued_messages.push_back(StateAction::Disconnect { peer_id, reason: None });
             }
@@ -326,8 +352,7 @@ where
             PeerAction::PeerRemoved(peer_id) => {
                 self.queued_messages.push_back(StateAction::PeerRemoved(peer_id))
             }
-            PeerAction::BanPeer { .. } => {}
-            PeerAction::UnBanPeer { .. } => {}
+            PeerAction::BanPeer { .. } | PeerAction::UnBanPeer { .. } => {}
         }
     }
 
@@ -372,7 +397,7 @@ where
     /// Invoked when received a response from a connected peer.
     ///
     /// Delegates the response result to the fetcher which may return an outcome specific
-    /// instruction that needs to be handled in [Self::on_block_response_outcome]. This could be
+    /// instruction that needs to be handled in [`Self::on_block_response_outcome`]. This could be
     /// a follow-up request or an instruction to slash the peer's reputation.
     fn on_eth_response(&mut self, peer: PeerId, resp: PeerResponseResult) -> Option<StateAction> {
         match resp {
@@ -413,12 +438,12 @@ where
             let mut received_responses = Vec::new();
 
             // poll all connected peers for responses
-            for (id, peer) in self.active_peers.iter_mut() {
+            for (id, peer) in &mut self.active_peers {
                 if let Some(mut response) = peer.pending_response.take() {
                     match response.poll(cx) {
                         Poll::Ready(res) => {
                             // check if the error is due to a closed channel to the session
-                            if res.err().map(|err| err.is_channel_closed()).unwrap_or_default() {
+                            if res.err().is_some_and(|err| err.is_channel_closed()) {
                                 debug!(
                                     target: "net",
                                     ?id,
@@ -471,7 +496,7 @@ pub(crate) struct ActivePeer {
     /// Best block of the peer.
     pub(crate) best_hash: B256,
     /// The capabilities of the remote peer.
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub(crate) capabilities: Arc<Capabilities>,
     /// A communication channel directly to the session task.
     pub(crate) request_tx: PeerRequestSender,
@@ -511,8 +536,8 @@ pub(crate) enum StateAction {
         /// The reported [`ForkId`] by this peer.
         fork_id: ForkId,
     },
-    /// A new node was found through the discovery, possibly with a ForkId
-    DiscoveredNode { peer_id: PeerId, socket_addr: SocketAddr, fork_id: Option<ForkId> },
+    /// A new node was found through the discovery, possibly with a `ForkId`
+    DiscoveredNode { peer_id: PeerId, addr: PeerAddr, fork_id: Option<ForkId> },
     /// A peer was added
     PeerAdded(PeerId),
     /// A peer was dropped
@@ -521,35 +546,39 @@ pub(crate) enum StateAction {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        discovery::Discovery, fetch::StateFetcher, message::PeerRequestSender, peers::PeersManager,
-        state::NetworkState, PeerRequest,
-    };
-    use reth_eth_wire::{
-        capability::{Capabilities, Capability},
-        BlockBodies, EthVersion,
-    };
-    use reth_interfaces::p2p::{bodies::client::BodiesClient, error::RequestError};
-    use reth_primitives::{BlockBody, Header, PeerId, B256};
-    use reth_provider::test_utils::NoopProvider;
     use std::{
         future::poll_fn,
         sync::{atomic::AtomicU64, Arc},
     };
+
+    use alloy_primitives::B256;
+    use reth_eth_wire::{BlockBodies, Capabilities, Capability, EthVersion};
+    use reth_network_api::PeerRequestSender;
+    use reth_network_p2p::{bodies::client::BodiesClient, error::RequestError};
+    use reth_network_peers::PeerId;
+    use reth_primitives::{BlockBody, Header};
+    use reth_provider::test_utils::NoopProvider;
     use tokio::sync::mpsc;
     use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
-    /// Returns a testing instance of the [NetworkState].
-    fn state() -> NetworkState<NoopProvider> {
+    use crate::{
+        discovery::Discovery,
+        fetch::StateFetcher,
+        peers::PeersManager,
+        state::{BlockNumReader, NetworkState},
+        PeerRequest,
+    };
+
+    /// Returns a testing instance of the [`NetworkState`].
+    fn state() -> NetworkState {
         let peers = PeersManager::default();
         let handle = peers.handle();
         NetworkState {
             active_peers: Default::default(),
             peers_manager: Default::default(),
             queued_messages: Default::default(),
-            client: NoopProvider::default(),
+            client: BlockNumReader(Box::new(NoopProvider::default())),
             discovery: Discovery::noop(),
-            genesis_hash: Default::default(),
             state_fetcher: StateFetcher::new(handle, Default::default()),
         }
     }

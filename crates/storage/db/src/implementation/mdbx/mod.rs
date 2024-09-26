@@ -1,20 +1,33 @@
 //! Module that interacts with MDBX.
 
 use crate::{
-    database::Database,
-    database_metrics::{DatabaseMetadata, DatabaseMetadataValue, DatabaseMetrics},
-    tables::{TableType, Tables},
+    lockfile::StorageLock,
+    metrics::DatabaseEnvMetrics,
+    tables::{self, TableType, Tables},
     utils::default_page_size,
     DatabaseError,
 };
 use eyre::Context;
 use metrics::{gauge, Label};
-use reth_interfaces::db::LogLevel;
-use reth_libmdbx::{
-    DatabaseFlags, Environment, EnvironmentFlags, Geometry, Mode, PageSize, SyncMode, RO, RW,
+use reth_db_api::{
+    cursor::{DbCursorRO, DbCursorRW},
+    database::Database,
+    database_metrics::{DatabaseMetadata, DatabaseMetadataValue, DatabaseMetrics},
+    models::ClientVersion,
+    transaction::{DbTx, DbTxMut},
 };
+use reth_libmdbx::{
+    ffi, DatabaseFlags, Environment, EnvironmentFlags, Geometry, HandleSlowReadersReturnCode,
+    MaxReadTransactionDuration, Mode, PageSize, SyncMode, RO, RW,
+};
+use reth_storage_errors::db::LogLevel;
 use reth_tracing::tracing::error;
-use std::{ops::Deref, path::Path};
+use std::{
+    ops::Deref,
+    path::Path,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tx::Tx;
 
 pub mod cursor;
@@ -26,6 +39,10 @@ const TERABYTE: usize = GIGABYTE * 1024;
 /// MDBX allows up to 32767 readers (`MDBX_READERS_LIMIT`), but we limit it to slightly below that
 const DEFAULT_MAX_READERS: u64 = 32_000;
 
+/// Space that a read-only transaction can occupy until the warning is emitted.
+/// See [`reth_libmdbx::EnvironmentBuilder::set_handle_slow_readers`] for more information.
+const MAX_SAFE_READER_SPACE: usize = 10 * GIGABYTE;
+
 /// Environment used when opening a MDBX environment. RO/RW.
 #[derive(Debug)]
 pub enum DatabaseEnvKind {
@@ -35,13 +52,92 @@ pub enum DatabaseEnvKind {
     RW,
 }
 
+impl DatabaseEnvKind {
+    /// Returns `true` if the environment is read-write.
+    pub const fn is_rw(&self) -> bool {
+        matches!(self, Self::RW)
+    }
+}
+
+/// Arguments for database initialization.
+#[derive(Clone, Debug, Default)]
+pub struct DatabaseArguments {
+    /// Client version that accesses the database.
+    client_version: ClientVersion,
+    /// Database log level. If [None], the default value is used.
+    log_level: Option<LogLevel>,
+    /// Maximum duration of a read transaction. If [None], the default value is used.
+    max_read_transaction_duration: Option<MaxReadTransactionDuration>,
+    /// Open environment in exclusive/monopolistic mode. If [None], the default value is used.
+    ///
+    /// This can be used as a replacement for `MDB_NOLOCK`, which don't supported by MDBX. In this
+    /// way, you can get the minimal overhead, but with the correct multi-process and multi-thread
+    /// locking.
+    ///
+    /// If `true` = open environment in exclusive/monopolistic mode or return `MDBX_BUSY` if
+    /// environment already used by other process. The main feature of the exclusive mode is the
+    /// ability to open the environment placed on a network share.
+    ///
+    /// If `false` = open environment in cooperative mode, i.e. for multi-process
+    /// access/interaction/cooperation. The main requirements of the cooperative mode are:
+    /// - Data files MUST be placed in the LOCAL file system, but NOT on a network share.
+    /// - Environment MUST be opened only by LOCAL processes, but NOT over a network.
+    /// - OS kernel (i.e. file system and memory mapping implementation) and all processes that
+    ///   open the given environment MUST be running in the physically single RAM with
+    ///   cache-coherency. The only exception for cache-consistency requirement is Linux on MIPS
+    ///   architecture, but this case has not been tested for a long time).
+    ///
+    /// This flag affects only at environment opening but can't be changed after.
+    exclusive: Option<bool>,
+}
+
+impl DatabaseArguments {
+    /// Create new database arguments with given client version.
+    pub const fn new(client_version: ClientVersion) -> Self {
+        Self {
+            client_version,
+            log_level: None,
+            max_read_transaction_duration: None,
+            exclusive: None,
+        }
+    }
+
+    /// Set the log level.
+    pub const fn with_log_level(mut self, log_level: Option<LogLevel>) -> Self {
+        self.log_level = log_level;
+        self
+    }
+
+    /// Set the maximum duration of a read transaction.
+    pub const fn with_max_read_transaction_duration(
+        mut self,
+        max_read_transaction_duration: Option<MaxReadTransactionDuration>,
+    ) -> Self {
+        self.max_read_transaction_duration = max_read_transaction_duration;
+        self
+    }
+
+    /// Set the mdbx exclusive flag.
+    pub const fn with_exclusive(mut self, exclusive: Option<bool>) -> Self {
+        self.exclusive = exclusive;
+        self
+    }
+
+    /// Returns the client version if any.
+    pub const fn client_version(&self) -> &ClientVersion {
+        &self.client_version
+    }
+}
+
 /// Wrapper for the libmdbx environment: [Environment]
 #[derive(Debug)]
 pub struct DatabaseEnv {
     /// Libmdbx-sys environment.
     inner: Environment,
-    /// Whether to record metrics or not.
-    with_metrics: bool,
+    /// Cache for metric handles. If `None`, metrics are not recorded.
+    metrics: Option<Arc<DatabaseEnvMetrics>>,
+    /// Write lock for when dealing with a read-write environment.
+    _lock_file: Option<StorageLock>,
 }
 
 impl Database for DatabaseEnv {
@@ -49,24 +145,26 @@ impl Database for DatabaseEnv {
     type TXMut = tx::Tx<RW>;
 
     fn tx(&self) -> Result<Self::TX, DatabaseError> {
-        Ok(Tx::new_with_metrics(
+        Tx::new_with_metrics(
             self.inner.begin_ro_txn().map_err(|e| DatabaseError::InitTx(e.into()))?,
-            self.with_metrics,
-        ))
+            self.metrics.clone(),
+        )
+        .map_err(|e| DatabaseError::InitTx(e.into()))
     }
 
     fn tx_mut(&self) -> Result<Self::TXMut, DatabaseError> {
-        Ok(Tx::new_with_metrics(
+        Tx::new_with_metrics(
             self.inner.begin_rw_txn().map_err(|e| DatabaseError::InitTx(e.into()))?,
-            self.with_metrics,
-        ))
+            self.metrics.clone(),
+        )
+        .map_err(|e| DatabaseError::InitTx(e.into()))
     }
 }
 
 impl DatabaseMetrics for DatabaseEnv {
     fn report_metrics(&self) {
         for (name, value, labels) in self.gauge_metrics() {
-            gauge!(name, value, labels);
+            gauge!(name, labels).set(value);
         }
     }
 
@@ -75,7 +173,7 @@ impl DatabaseMetrics for DatabaseEnv {
 
         let _ = self
             .view(|tx| {
-                for table in Tables::ALL.iter().map(|table| table.name()) {
+                for table in Tables::ALL.iter().map(Tables::name) {
                     let table_db = tx.inner.open_db(Some(table)).wrap_err("Could not open db.")?;
 
                     let stats = tx
@@ -120,13 +218,23 @@ impl DatabaseMetrics for DatabaseEnv {
 
                 Ok::<(), eyre::Report>(())
             })
-            .map_err(|error| error!(?error, "Failed to read db table stats"));
+            .map_err(|error| error!(%error, "Failed to read db table stats"));
 
         if let Ok(freelist) =
-            self.freelist().map_err(|error| error!(?error, "Failed to read db.freelist"))
+            self.freelist().map_err(|error| error!(%error, "Failed to read db.freelist"))
         {
             metrics.push(("db.freelist", freelist as f64, vec![]));
         }
+
+        if let Ok(stat) = self.stat().map_err(|error| error!(%error, "Failed to read db.stat")) {
+            metrics.push(("db.page_size", stat.page_size() as f64, vec![]));
+        }
+
+        metrics.push((
+            "db.timed_out_not_aborted_transactions",
+            self.timed_out_not_aborted_transactions() as f64,
+            vec![],
+        ));
 
         metrics
     }
@@ -145,8 +253,17 @@ impl DatabaseEnv {
     pub fn open(
         path: &Path,
         kind: DatabaseEnvKind,
-        log_level: Option<LogLevel>,
-    ) -> Result<DatabaseEnv, DatabaseError> {
+        args: DatabaseArguments,
+    ) -> Result<Self, DatabaseError> {
+        let _lock_file = if kind.is_rw() {
+            Some(
+                StorageLock::try_acquire(path)
+                    .map_err(|err| DatabaseError::Other(err.to_string()))?,
+            )
+        } else {
+            None
+        };
+
         let mut inner_env = Environment::builder();
 
         let mode = match kind {
@@ -158,25 +275,75 @@ impl DatabaseEnv {
             }
         };
 
-        inner_env.set_max_dbs(Tables::ALL.len());
+        // Note: We set max dbs to 256 here to allow for custom tables. This needs to be set on
+        // environment creation.
+        debug_assert!(Tables::ALL.len() <= 256, "number of tables exceed max dbs");
+        inner_env.set_max_dbs(256);
         inner_env.set_geometry(Geometry {
             // Maximum database size of 4 terabytes
             size: Some(0..(4 * TERABYTE)),
             // We grow the database in increments of 4 gigabytes
             growth_step: Some(4 * GIGABYTE as isize),
             // The database never shrinks
-            shrink_threshold: None,
+            shrink_threshold: Some(0),
             page_size: Some(PageSize::Set(default_page_size())),
         });
+
+        fn is_current_process(id: u32) -> bool {
+            #[cfg(unix)]
+            {
+                id == std::os::unix::process::parent_id() || id == std::process::id()
+            }
+
+            #[cfg(not(unix))]
+            {
+                id == std::process::id()
+            }
+        }
+
+        extern "C" fn handle_slow_readers(
+            _env: *const ffi::MDBX_env,
+            _txn: *const ffi::MDBX_txn,
+            process_id: ffi::mdbx_pid_t,
+            thread_id: ffi::mdbx_tid_t,
+            read_txn_id: u64,
+            gap: std::ffi::c_uint,
+            space: usize,
+            retry: std::ffi::c_int,
+        ) -> HandleSlowReadersReturnCode {
+            if space > MAX_SAFE_READER_SPACE {
+                let message = if is_current_process(process_id as u32) {
+                    "Current process has a long-lived database transaction that grows the database file."
+                } else {
+                    "External process has a long-lived database transaction that grows the database file. \
+                     Use shorter-lived read transactions or shut down the node."
+                };
+                reth_tracing::tracing::warn!(
+                    target: "storage::db::mdbx",
+                    ?process_id,
+                    ?thread_id,
+                    ?read_txn_id,
+                    ?gap,
+                    ?space,
+                    ?retry,
+                    "{message}"
+                )
+            }
+
+            reth_libmdbx::HandleSlowReadersReturnCode::ProceedWithoutKillingReader
+        }
+        inner_env.set_handle_slow_readers(handle_slow_readers);
+
         inner_env.set_flags(EnvironmentFlags {
             mode,
             // We disable readahead because it improves performance for linear scans, but
             // worsens it for random access (which is our access pattern outside of sync)
             no_rdahead: true,
             coalesce: true,
+            exclusive: args.exclusive.unwrap_or_default(),
             ..Default::default()
         });
-        // configure more readers
+        // Configure more readers
         inner_env.set_max_readers(DEFAULT_MAX_READERS);
         // This parameter sets the maximum size of the "reclaimed list", and the unit of measurement
         // is "pages". Reclaimed list is the list of freed pages that's populated during the
@@ -205,7 +372,7 @@ impl DatabaseEnv {
         // https://github.com/paradigmxyz/reth/blob/fa2b9b685ed9787636d962f4366caf34a9186e66/crates/storage/libmdbx-rs/mdbx-sys/libmdbx/mdbx.c#L16017.
         inner_env.set_rp_augment_limit(256 * 1024);
 
-        if let Some(log_level) = log_level {
+        if let Some(log_level) = args.log_level {
             // Levels higher than [LogLevel::Notice] require libmdbx built with `MDBX_DEBUG` option.
             let is_log_level_available = if cfg!(debug_assertions) {
                 true
@@ -227,13 +394,18 @@ impl DatabaseEnv {
                     LogLevel::Extra => 7,
                 });
             } else {
-                return Err(DatabaseError::LogLevelUnavailable(log_level));
+                return Err(DatabaseError::LogLevelUnavailable(log_level))
             }
         }
 
-        let env = DatabaseEnv {
+        if let Some(max_read_transaction_duration) = args.max_read_transaction_duration {
+            inner_env.set_max_read_transaction_duration(max_read_transaction_duration);
+        }
+
+        let env = Self {
             inner: inner_env.open(path).map_err(|e| DatabaseError::Open(e.into()))?,
-            with_metrics: false,
+            metrics: None,
+            _lock_file,
         };
 
         Ok(env)
@@ -241,7 +413,7 @@ impl DatabaseEnv {
 
     /// Enables metrics on the database.
     pub fn with_metrics(mut self) -> Self {
-        self.with_metrics = true;
+        self.metrics = Some(DatabaseEnvMetrics::new().into());
         self
     }
 
@@ -263,6 +435,27 @@ impl DatabaseEnv {
 
         Ok(())
     }
+
+    /// Records version that accesses the database with write privileges.
+    pub fn record_client_version(&self, version: ClientVersion) -> Result<(), DatabaseError> {
+        if version.is_empty() {
+            return Ok(())
+        }
+
+        let tx = self.tx_mut()?;
+        let mut version_cursor = tx.cursor_write::<tables::VersionHistory>()?;
+
+        let last_version = version_cursor.last()?.map(|(_, v)| v);
+        if Some(&version) != last_version.as_ref() {
+            version_cursor.upsert(
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                version,
+            )?;
+            tx.commit()?;
+        }
+
+        Ok(())
+    }
 }
 
 impl Deref for DatabaseEnv {
@@ -277,18 +470,23 @@ impl Deref for DatabaseEnv {
 mod tests {
     use super::*;
     use crate::{
-        abstraction::table::{Encode, Table},
-        cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW, ReverseWalker, Walker},
-        database::Database,
-        models::{AccountBeforeTx, ShardedKey},
-        tables::{AccountHistory, CanonicalHeaders, Headers, PlainAccountState, PlainStorageState},
+        tables::{
+            AccountsHistory, CanonicalHeaders, Headers, PlainAccountState, PlainStorageState,
+        },
         test_utils::*,
-        transaction::{DbTx, DbTxMut},
-        AccountChangeSet,
+        AccountChangeSets,
     };
-    use reth_interfaces::db::{DatabaseWriteError, DatabaseWriteOperation};
-    use reth_primitives::{Account, Address, Header, IntegerList, StorageEntry, B256, U256};
-    use std::{path::Path, str::FromStr, sync::Arc};
+    use alloy_primitives::{Address, B256, U256};
+    use reth_db_api::{
+        cursor::{DbDupCursorRO, DbDupCursorRW, ReverseWalker, Walker},
+        models::{AccountBeforeTx, ShardedKey},
+        table::{Encode, Table},
+    };
+    use reth_libmdbx::Error;
+    use reth_primitives::{Account, Header, StorageEntry};
+    use reth_primitives_traits::IntegerList;
+    use reth_storage_errors::db::{DatabaseWriteError, DatabaseWriteOperation};
+    use std::str::FromStr;
     use tempfile::TempDir;
 
     /// Create database for testing
@@ -301,7 +499,8 @@ mod tests {
 
     /// Create database for testing with specified path
     fn create_test_db_with_path(kind: DatabaseEnvKind, path: &Path) -> DatabaseEnv {
-        let env = DatabaseEnv::open(path, kind, None).expect(ERROR_DB_CREATION);
+        let env = DatabaseEnv::open(path, kind, DatabaseArguments::new(ClientVersion::default()))
+            .expect(ERROR_DB_CREATION);
         env.create_tables().expect(ERROR_TABLE_CREATION);
         env
     }
@@ -311,6 +510,7 @@ mod tests {
     const ERROR_APPEND: &str = "Not able to append the value to the table.";
     const ERROR_UPSERT: &str = "Not able to upsert the value to the table.";
     const ERROR_GET: &str = "Not able to get value from table.";
+    const ERROR_DEL: &str = "Not able to delete from table.";
     const ERROR_COMMIT: &str = "Not able to commit transaction.";
     const ERROR_RETURN_VALUE: &str = "Mismatching result.";
     const ERROR_INIT_TX: &str = "Failed to create a MDBX transaction.";
@@ -336,8 +536,47 @@ mod tests {
         // GET
         let tx = env.tx().expect(ERROR_INIT_TX);
         let result = tx.get::<Headers>(key).expect(ERROR_GET);
-        assert!(result.expect(ERROR_RETURN_VALUE) == value);
+        assert_eq!(result.expect(ERROR_RETURN_VALUE), value);
         tx.commit().expect(ERROR_COMMIT);
+    }
+
+    #[test]
+    fn db_dup_cursor_delete_first() {
+        let db: Arc<DatabaseEnv> = create_test_db(DatabaseEnvKind::RW);
+        let tx = db.tx_mut().expect(ERROR_INIT_TX);
+
+        let mut dup_cursor = tx.cursor_dup_write::<PlainStorageState>().unwrap();
+
+        let entry_0 = StorageEntry { key: B256::with_last_byte(1), value: U256::from(0) };
+        let entry_1 = StorageEntry { key: B256::with_last_byte(1), value: U256::from(1) };
+
+        dup_cursor.upsert(Address::with_last_byte(1), entry_0).expect(ERROR_UPSERT);
+        dup_cursor.upsert(Address::with_last_byte(1), entry_1).expect(ERROR_UPSERT);
+
+        assert_eq!(
+            dup_cursor.walk(None).unwrap().collect::<Result<Vec<_>, _>>(),
+            Ok(vec![(Address::with_last_byte(1), entry_0), (Address::with_last_byte(1), entry_1),])
+        );
+
+        let mut walker = dup_cursor.walk(None).unwrap();
+        walker.delete_current().expect(ERROR_DEL);
+
+        assert_eq!(walker.next(), Some(Ok((Address::with_last_byte(1), entry_1))));
+
+        // Check the tx view - it correctly holds entry_1
+        assert_eq!(
+            tx.cursor_dup_read::<PlainStorageState>()
+                .unwrap()
+                .walk(None)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>(),
+            Ok(vec![
+                (Address::with_last_byte(1), entry_1), // This is ok - we removed entry_0
+            ])
+        );
+
+        // Check the remainder of walker
+        assert_eq!(walker.next(), None);
     }
 
     #[test]
@@ -438,24 +677,24 @@ mod tests {
         let address2 = Address::with_last_byte(2);
 
         let tx = db.tx_mut().expect(ERROR_INIT_TX);
-        tx.put::<AccountChangeSet>(0, AccountBeforeTx { address: address0, info: None })
+        tx.put::<AccountChangeSets>(0, AccountBeforeTx { address: address0, info: None })
             .expect(ERROR_PUT);
-        tx.put::<AccountChangeSet>(0, AccountBeforeTx { address: address1, info: None })
+        tx.put::<AccountChangeSets>(0, AccountBeforeTx { address: address1, info: None })
             .expect(ERROR_PUT);
-        tx.put::<AccountChangeSet>(0, AccountBeforeTx { address: address2, info: None })
+        tx.put::<AccountChangeSets>(0, AccountBeforeTx { address: address2, info: None })
             .expect(ERROR_PUT);
-        tx.put::<AccountChangeSet>(1, AccountBeforeTx { address: address0, info: None })
+        tx.put::<AccountChangeSets>(1, AccountBeforeTx { address: address0, info: None })
             .expect(ERROR_PUT);
-        tx.put::<AccountChangeSet>(1, AccountBeforeTx { address: address1, info: None })
+        tx.put::<AccountChangeSets>(1, AccountBeforeTx { address: address1, info: None })
             .expect(ERROR_PUT);
-        tx.put::<AccountChangeSet>(1, AccountBeforeTx { address: address2, info: None })
+        tx.put::<AccountChangeSets>(1, AccountBeforeTx { address: address2, info: None })
             .expect(ERROR_PUT);
-        tx.put::<AccountChangeSet>(2, AccountBeforeTx { address: address0, info: None }) // <- should not be returned by the walker
+        tx.put::<AccountChangeSets>(2, AccountBeforeTx { address: address0, info: None }) // <- should not be returned by the walker
             .expect(ERROR_PUT);
         tx.commit().expect(ERROR_COMMIT);
 
         let tx = db.tx().expect(ERROR_INIT_TX);
-        let mut cursor = tx.cursor_read::<AccountChangeSet>().unwrap();
+        let mut cursor = tx.cursor_read::<AccountChangeSets>().unwrap();
 
         let entries = cursor.walk_range(..).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(entries.len(), 7);
@@ -648,7 +887,7 @@ mod tests {
         assert_eq!(
             cursor.insert(key_to_insert, B256::ZERO),
             Err(DatabaseWriteError {
-                code: -30799,
+                info: Error::KeyExist.into(),
                 operation: DatabaseWriteOperation::CursorInsert,
                 table_name: CanonicalHeaders::NAME,
                 key: key_to_insert.encode().into(),
@@ -792,7 +1031,7 @@ mod tests {
         assert_eq!(
             cursor.append(key_to_append, B256::ZERO),
             Err(DatabaseWriteError {
-                code: -30418,
+                info: Error::KeyMismatch.into(),
                 operation: DatabaseWriteOperation::CursorAppend,
                 table_name: CanonicalHeaders::NAME,
                 key: key_to_append.encode().into(),
@@ -852,7 +1091,7 @@ mod tests {
         let transition_id = 2;
 
         let tx = db.tx_mut().expect(ERROR_INIT_TX);
-        let mut cursor = tx.cursor_write::<AccountChangeSet>().unwrap();
+        let mut cursor = tx.cursor_write::<AccountChangeSets>().unwrap();
         vec![0, 1, 3, 4, 5]
             .into_iter()
             .try_for_each(|val| {
@@ -867,16 +1106,16 @@ mod tests {
         // APPEND DUP & APPEND
         let subkey_to_append = 2;
         let tx = db.tx_mut().expect(ERROR_INIT_TX);
-        let mut cursor = tx.cursor_write::<AccountChangeSet>().unwrap();
+        let mut cursor = tx.cursor_write::<AccountChangeSets>().unwrap();
         assert_eq!(
             cursor.append_dup(
                 transition_id,
                 AccountBeforeTx { address: Address::with_last_byte(subkey_to_append), info: None }
             ),
             Err(DatabaseWriteError {
-                code: -30418,
+                info: Error::KeyMismatch.into(),
                 operation: DatabaseWriteOperation::CursorAppendDup,
-                table_name: AccountChangeSet::NAME,
+                table_name: AccountChangeSets::NAME,
                 key: transition_id.encode().into(),
             }
             .into())
@@ -887,9 +1126,9 @@ mod tests {
                 AccountBeforeTx { address: Address::with_last_byte(subkey_to_append), info: None }
             ),
             Err(DatabaseWriteError {
-                code: -30418,
+                info: Error::KeyMismatch.into(),
                 operation: DatabaseWriteOperation::CursorAppend,
-                table_name: AccountChangeSet::NAME,
+                table_name: AccountChangeSets::NAME,
                 key: (transition_id - 1).encode().into(),
             }
             .into())
@@ -926,7 +1165,12 @@ mod tests {
             assert_eq!(result.expect(ERROR_RETURN_VALUE), 200);
         }
 
-        let env = DatabaseEnv::open(&path, DatabaseEnvKind::RO, None).expect(ERROR_DB_CREATION);
+        let env = DatabaseEnv::open(
+            &path,
+            DatabaseEnvKind::RO,
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .expect(ERROR_DB_CREATION);
 
         // GET
         let result =
@@ -959,9 +1203,9 @@ mod tests {
             let mut cursor = tx.cursor_dup_read::<PlainStorageState>().unwrap();
 
             // Notice that value11 and value22 have been ordered in the DB.
-            assert!(Some(value00) == cursor.next_dup_val().unwrap());
-            assert!(Some(value11) == cursor.next_dup_val().unwrap());
-            assert!(Some(value22) == cursor.next_dup_val().unwrap());
+            assert_eq!(Some(value00), cursor.next_dup_val().unwrap());
+            assert_eq!(Some(value11), cursor.next_dup_val().unwrap());
+            assert_eq!(Some(value22), cursor.next_dup_val().unwrap());
         }
 
         // Seek value with exact subkey
@@ -1077,13 +1321,14 @@ mod tests {
             let key = ShardedKey::new(real_key, i * 100);
             let list: IntegerList = vec![i * 100u64].into();
 
-            db.update(|tx| tx.put::<AccountHistory>(key.clone(), list.clone()).expect("")).unwrap();
+            db.update(|tx| tx.put::<AccountsHistory>(key.clone(), list.clone()).expect(""))
+                .unwrap();
         }
 
         // Seek value with non existing key.
         {
             let tx = db.tx().expect(ERROR_INIT_TX);
-            let mut cursor = tx.cursor_read::<AccountHistory>().unwrap();
+            let mut cursor = tx.cursor_read::<AccountsHistory>().unwrap();
 
             // It will seek the one greater or equal to the query. Since we have `Address | 100`,
             // `Address | 200` in the database and we're querying `Address | 150` it will return us
@@ -1101,7 +1346,7 @@ mod tests {
         // Seek greatest index
         {
             let tx = db.tx().expect(ERROR_INIT_TX);
-            let mut cursor = tx.cursor_read::<AccountHistory>().unwrap();
+            let mut cursor = tx.cursor_read::<AccountsHistory>().unwrap();
 
             // It will seek the MAX value of transition index and try to use prev to get first
             // biggers.

@@ -1,4 +1,4 @@
-#![allow(dead_code, unused)]
+use super::txpool::PendingFees;
 use crate::{
     identifier::TransactionId, pool::size::SizeTracker, traits::BestTransactionsAttributes,
     PoolTransaction, SubPoolLimit, ValidPoolTransaction,
@@ -8,8 +8,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
-
-use super::txpool::PendingFees;
 
 /// A set of validated blob transactions in the pool that are __not pending__.
 ///
@@ -82,12 +80,48 @@ impl<T: PoolTransaction> BlobTransactions<T> {
         Some(tx.transaction)
     }
 
-    /// Returns all transactions that satisfy the given basefee and blob_fee.
+    /// Returns all transactions that satisfy the given basefee and blobfee.
+    ///
+    /// Note: This does not remove any the transactions from the pool.
     pub(crate) fn satisfy_attributes(
         &self,
         best_transactions_attributes: BestTransactionsAttributes,
     ) -> Vec<Arc<ValidPoolTransaction<T>>> {
-        Vec::new()
+        let mut transactions = Vec::new();
+        {
+            // short path if blob_fee is None in provided best transactions attributes
+            if let Some(blob_fee_to_satisfy) =
+                best_transactions_attributes.blob_fee.map(|fee| fee as u128)
+            {
+                let mut iter = self.by_id.iter().peekable();
+
+                while let Some((id, tx)) = iter.next() {
+                    if tx.transaction.max_fee_per_blob_gas().unwrap_or_default() <
+                        blob_fee_to_satisfy ||
+                        tx.transaction.max_fee_per_gas() <
+                            best_transactions_attributes.basefee as u128
+                    {
+                        // does not satisfy the blob fee or base fee
+                        // still parked in blob pool -> skip descendant transactions
+                        'this: while let Some((peek, _)) = iter.peek() {
+                            if peek.sender != id.sender {
+                                break 'this
+                            }
+                            iter.next();
+                        }
+                    } else {
+                        transactions.push(tx.transaction.clone());
+                    }
+                }
+            }
+        }
+        transactions
+    }
+
+    /// Returns true if the pool exceeds the given limit
+    #[inline]
+    pub(crate) fn exceeds(&self, limit: &SubPoolLimit) -> bool {
+        limit.is_exceeded(self.len(), self.size())
     }
 
     /// The reported size of all transactions in this pool.
@@ -102,7 +136,7 @@ impl<T: PoolTransaction> BlobTransactions<T> {
 
     /// Returns whether the pool is empty
     #[cfg(test)]
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.by_id.is_empty()
     }
@@ -134,7 +168,7 @@ impl<T: PoolTransaction> BlobTransactions<T> {
         transactions
     }
 
-    /// Resorts the transactions in the pool based on the pool's current [PendingFees].
+    /// Resorts the transactions in the pool based on the pool's current [`PendingFees`].
     pub(crate) fn reprioritize(&mut self) {
         // mem::take to modify without allocating, then collect to rebuild the BTreeSet
         self.all = std::mem::take(&mut self.all)
@@ -156,7 +190,7 @@ impl<T: PoolTransaction> BlobTransactions<T> {
     ///  * have a `max_fee_per_blob_gas` greater than or equal to the given `blob_fee`, _and_
     ///  * have a `max_fee_per_gas` greater than or equal to the given `base_fee`
     ///
-    /// This also sets the [PendingFees] for the pool, resorting transactions based on their
+    /// This also sets the [`PendingFees`] for the pool, resorting transactions based on their
     /// updated priority.
     ///
     /// Note: the transactions are not returned in a particular order.
@@ -178,10 +212,10 @@ impl<T: PoolTransaction> BlobTransactions<T> {
         removed
     }
 
-    /// Removes transactions until the pool satisfies its [SubPoolLimit].
+    /// Removes transactions until the pool satisfies its [`SubPoolLimit`].
     ///
     /// This is done by removing transactions according to their ordering in the pool, defined by
-    /// the [BlobOrd] struct.
+    /// the [`BlobOrd`] struct.
     ///
     /// Removed transactions are returned in the order they were removed.
     pub(crate) fn truncate_pool(
@@ -190,7 +224,7 @@ impl<T: PoolTransaction> BlobTransactions<T> {
     ) -> Vec<Arc<ValidPoolTransaction<T>>> {
         let mut removed = Vec::new();
 
-        while self.size() > limit.max_size && self.len() > limit.max_txs {
+        while self.exceeds(&limit) {
             let tx = self.all.last().expect("pool is not empty");
             let id = *tx.transaction.id();
             removed.push(self.remove_transaction(&id).expect("transaction exists"));
@@ -373,7 +407,7 @@ pub fn blob_tx_priority(
 /// A struct used to determine the ordering for a specific blob transaction in the pool. This uses
 /// a `priority` value to determine the ordering, and uses the `submission_id` to break ties.
 ///
-/// The `priority` value is calculated using the [blob_tx_priority] function, and should be
+/// The `priority` value is calculated using the [`blob_tx_priority`] function, and should be
 /// re-calculated on each block.
 #[derive(Debug, Clone)]
 struct BlobOrd {
@@ -399,18 +433,19 @@ impl PartialOrd<Self> for BlobOrd {
 }
 
 impl Ord for BlobOrd {
+    /// Compares two `BlobOrd` instances.
+    ///
+    /// The comparison is performed in reverse order based on the priority field. This is
+    /// because transactions with larger negative values in the priority field will take more fee
+    /// jumps, making them take longer to become executable. Therefore, transactions with lower
+    /// ordering should return `Greater`, ensuring they are evicted first.
+    ///
+    /// If the priority values are equal, the submission ID is used to break ties.
     fn cmp(&self, other: &Self) -> Ordering {
-        // order in reverse, so transactions with a lower ordering return Greater - this is
-        // important because transactions with larger negative values will take more fee jumps and
-        // it will take longer to become executable, so those should be evicted first
-        let ord = other.priority.cmp(&self.priority);
-
-        // use submission_id to break ties
-        if ord == Ordering::Equal {
-            self.submission_id.cmp(&other.submission_id)
-        } else {
-            ord
-        }
+        other
+            .priority
+            .cmp(&self.priority)
+            .then_with(|| self.submission_id.cmp(&other.submission_id))
     }
 }
 
@@ -610,7 +645,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
-            for tx in txs.iter() {
+            for tx in &txs {
                 pool.add_transaction(factory.validated_arc(tx.clone()));
             }
 
@@ -655,8 +690,7 @@ mod tests {
             let actual = fee_delta(tx_fee, base_fee);
             assert_eq!(
                 actual, expected,
-                "fee_delta({}, {}) = {}, expected: {}",
-                tx_fee, base_fee, actual, expected
+                "fee_delta({tx_fee}, {base_fee}) = {actual}, expected: {expected}"
             );
         }
     }

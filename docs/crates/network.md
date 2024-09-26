@@ -8,7 +8,7 @@ Reth's P2P networking consists primarily of 4 ongoing tasks:
 - **ETH Requests**: Responds to incoming requests for headers and bodies
 - **Network Management**: Handles incoming & outgoing connections with peers, and routes requests between peers and the other tasks
 
-We'll leave most of the discussion of the discovery task for the [discv4](../discv4/README.md) chapter, and will focus on the other three here.
+We'll leave most of the discussion of the discovery task for the [discv4](./discv4.md) chapter, and will focus on the other three here.
 
 Let's take a look at how the main Reth CLI (i.e., a default-configured full node) makes use of the P2P layer to explore the primary interfaces and entrypoints into the `network` crate.
 
@@ -145,7 +145,7 @@ pub struct NetworkConfig<C> {
     pub executor: Option<TaskExecutor>,
     /// The `Status` message to send to peers at the beginning.
     pub status: Status,
-    /// Sets the hello message for the p2p handshake in RLPx
+    /// Sets the hello message for the p2p handshake in ``RLPx``
     pub hello_message: HelloMessage,
 }
 ```
@@ -168,7 +168,7 @@ The `Swarm` struct glues together incoming connections from peers, managing sess
 
 We'll touch more on the `NetworkManager` shortly! It's perhaps the most important struct in this crate.
 
-More information about the discovery task can be found in the [discv4](../discv4/README.md) chapter.
+More information about the discovery task can be found in the [discv4](./discv4.md) chapter.
 
 The ETH requests and transactions task will be explained in their own sections, following this one.
 
@@ -312,7 +312,7 @@ pub struct NetworkState<C> {
     genesis_hash: B256,
     /// The type that handles requests.
     ///
-    /// The fetcher streams RLPx related requests on a per-peer basis to this type. This type will
+    /// The fetcher streams ``RLPx`` related requests on a per-peer basis to this type. This type will
     /// then queue in the request and notify the fetcher once the result has been received.
     state_fetcher: StateFetcher,
 }
@@ -440,7 +440,7 @@ fn poll_action(&mut self) -> PollAction {
         return PollAction::NoPeersAvailable
     };
 
-    let request = self.queued_requests.pop_front().expect("not empty; qed");
+    let request = self.queued_requests.pop_front().expect("not empty");
     let request = self.prepare_block_request(peer_id, request);
 
     PollAction::Ready(FetchAction::BlockRequest { peer_id, request })
@@ -461,7 +461,7 @@ pub struct EthRequestHandler<C> {
     /// The client type that can interact with the chain.
     client: Arc<C>,
     /// Used for reporting peers.
-    #[allow(unused)]
+    #[allow(dead_code)]
     peers: PeersHandle,
     /// Incoming request from the [NetworkManager](crate::NetworkManager).
     incoming_requests: UnboundedReceiverStream<IncomingEthRequest>,
@@ -648,8 +648,8 @@ fn on_bodies_request(
 
 ## Transactions Task
 
-The transactions task listens for, requests, and propagates transactions both from the node's peers, and those that are added locally (e.g., submitted via RPC). Note that this task focuses solely on the network communication involved with Ethereum transactions, we will talk more about the structure of the transaction pool itself 
-in the [transaction-pool](../../../ethereum/transaction-pool/README.md) chapter.
+The transactions task listens for, requests, and propagates transactions both from the node's peers, and those that are added locally (e.g., submitted via RPC). Note that this task focuses solely on the network communication involved with Ethereum transactions, we will talk more about the structure of the transaction pool itself
+in the [transaction-pool](https://reth.rs/docs/reth_transaction_pool/index.html) chapter.
 
 Again, like the network management and ETH requests tasks, the transactions task is implemented as an endless future that runs as a background task on a standalone `tokio::task`. It's represented by the `TransactionsManager` struct:
 
@@ -832,9 +832,9 @@ struct Peer {
 }
 ```
 
-Note that the `Peer` struct contains a field `transactions`, which is an [LRU cache](https://en.wikipedia.org/wiki/Cache_replacement_policies#Least_recently_used_(LRU)) of the transactions this peer is aware of. 
+Note that the `Peer` struct contains a field `transactions`, which is an [LRU cache](https://en.wikipedia.org/wiki/Cache_replacement_policies#Least_recently_used_(LRU)) of the transactions this peer is aware of.
 
-The `request_tx` field on the `Peer` is used at the sender end of a channel to send requests to the session with the peer.
+The `request_tx` field on the `Peer` is used as the sender end of a channel to send requests to the session with the peer.
 
 After the `Peer` is added to `TransactionsManager.peers`, the hashes of all of the transactions in the node's transaction pool are sent to the peer in a [`NewPooledTransactionHashes` message](https://github.com/ethereum/devp2p/blob/master/caps/eth.md#newpooledtransactionhashes-0x08).
 
@@ -911,7 +911,7 @@ fn propagate_transactions(
 ) -> PropagatedTransactions {
     let mut propagated = PropagatedTransactions::default();
 
-    // send full transactions to a fraction fo the connected peers (square root of the total
+    // send full transactions to a fraction of the connected peers (square root of the total
     // number of connected peers)
     let max_num_full = (self.peers.len() as f64).sqrt() as usize + 1;
 

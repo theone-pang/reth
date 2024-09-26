@@ -11,7 +11,6 @@
 !Cross.toml
 !deny.toml
 !Makefile
-!deploy
 
 # include for vergen constants
 !/.git

@@ -1,42 +1,46 @@
 //! Builder support for configuring the entire setup.
 
-use crate::{
-    consensus::NetworkClayerManager, eth_requests::EthRequestHandler,
-    transactions::TransactionsManager, NetworkHandle, NetworkManager,
-};
-use reth_interfaces::clayer::ClayerConsensusMessageAgentTrait;
+use reth_eth_wire::ClayerConsensusMessageAgentTrait;
+use reth_network_api::test_utils::PeersHandleProvider;
 use reth_transaction_pool::TransactionPool;
 use tokio::sync::mpsc;
 
-/// We set the max channel capacity of the EthRequestHandler to 256
+use crate::{
+    consensus::NetworkClayerManager,
+    eth_requests::EthRequestHandler,
+    transactions::{TransactionsManager, TransactionsManagerConfig},
+    NetworkHandle, NetworkManager,
+};
+
+/// We set the max channel capacity of the `EthRequestHandler` to 256
 /// 256 requests with malicious 10MB body requests is 2.6GB which can be absorbed by the node.
 pub(crate) const ETH_REQUEST_CHANNEL_CAPACITY: usize = 256;
 
 /// A builder that can configure all components of the network.
 #[allow(missing_debug_implementations)]
-pub struct NetworkBuilder<C, Tx, Eth, Cl> {
-    pub(crate) network: NetworkManager<C>,
+pub struct NetworkBuilder<Tx, Eth, Cm> {
+    pub(crate) network: NetworkManager,
     pub(crate) transactions: Tx,
     pub(crate) request_handler: Eth,
-    pub(crate) consensus_manager: Cl,
+    pub(crate) consensus_manager: Cm,
 }
 
 // === impl NetworkBuilder ===
 
-impl<C, Tx, Eth, Cl> NetworkBuilder<C, Tx, Eth, Cl> {
+impl<Tx, Eth, Cm> NetworkBuilder<Tx, Eth, Cm> {
     /// Consumes the type and returns all fields.
-    pub fn split(self) -> (NetworkManager<C>, Tx, Eth, Cl) {
-        let NetworkBuilder { network, transactions, request_handler, consensus_manager } = self;
+    pub fn split(self) -> (NetworkManager, Tx, Eth, Cm) {
+        let Self { network, transactions, request_handler, consensus_manager } = self;
         (network, transactions, request_handler, consensus_manager)
     }
 
     /// Returns the network manager.
-    pub fn network(&self) -> &NetworkManager<C> {
+    pub const fn network(&self) -> &NetworkManager {
         &self.network
     }
 
     /// Returns the mutable network manager.
-    pub fn network_mut(&mut self) -> &mut NetworkManager<C> {
+    pub fn network_mut(&mut self) -> &mut NetworkManager {
         &mut self.network
     }
 
@@ -46,8 +50,8 @@ impl<C, Tx, Eth, Cl> NetworkBuilder<C, Tx, Eth, Cl> {
     }
 
     /// Consumes the type and returns all fields and also return a [`NetworkHandle`].
-    pub fn split_with_handle(self) -> (NetworkHandle, NetworkManager<C>, Tx, Eth, Cl) {
-        let NetworkBuilder { network, transactions, request_handler, consensus_manager } = self;
+    pub fn split_with_handle(self) -> (NetworkHandle, NetworkManager, Tx, Eth, Cm) {
+        let Self { network, transactions, request_handler, consensus_manager } = self;
         let handle = network.handle().clone();
         (handle, network, transactions, request_handler, consensus_manager)
     }
@@ -56,12 +60,13 @@ impl<C, Tx, Eth, Cl> NetworkBuilder<C, Tx, Eth, Cl> {
     pub fn transactions<Pool: TransactionPool>(
         self,
         pool: Pool,
-    ) -> NetworkBuilder<C, TransactionsManager<Pool>, Eth, Cl> {
-        let NetworkBuilder { mut network, request_handler, consensus_manager, .. } = self;
+        transactions_manager_config: TransactionsManagerConfig,
+    ) -> NetworkBuilder<TransactionsManager<Pool>, Eth, Cm> {
+        let Self { mut network, request_handler, consensus_manager, .. } = self;
         let (tx, rx) = mpsc::unbounded_channel();
         network.set_transactions(tx);
         let handle = network.handle().clone();
-        let transactions = TransactionsManager::new(handle, pool, rx);
+        let transactions = TransactionsManager::new(handle, pool, rx, transactions_manager_config);
         NetworkBuilder { network, request_handler, transactions, consensus_manager }
     }
 
@@ -69,8 +74,8 @@ impl<C, Tx, Eth, Cl> NetworkBuilder<C, Tx, Eth, Cl> {
     pub fn request_handler<Client>(
         self,
         client: Client,
-    ) -> NetworkBuilder<C, Tx, EthRequestHandler<Client>, Cl> {
-        let NetworkBuilder { mut network, transactions, consensus_manager, .. } = self;
+    ) -> NetworkBuilder<Tx, EthRequestHandler<Client>, Cm> {
+        let Self { mut network, transactions, consensus_manager, .. } = self;
         let (tx, rx) = mpsc::channel(ETH_REQUEST_CHANNEL_CAPACITY);
         network.set_eth_request_handler(tx);
         let peers = network.handle().peers_handle().clone();
@@ -78,16 +83,16 @@ impl<C, Tx, Eth, Cl> NetworkBuilder<C, Tx, Eth, Cl> {
         NetworkBuilder { network, request_handler, transactions, consensus_manager }
     }
 
-    ///
-    pub fn consensus<Consensus: ClayerConsensusMessageAgentTrait>(
+    /// Creates a new [`NetworkClayerManager`] and wires it to the network.
+    pub fn consensus<ConsensusAgent: ClayerConsensusMessageAgentTrait>(
         self,
-        consensus: Consensus,
-    ) -> NetworkBuilder<C, Tx, Eth, NetworkClayerManager<Consensus>> {
+        consensus_agent: ConsensusAgent,
+    ) -> NetworkBuilder<Tx, Eth, NetworkClayerManager<ConsensusAgent>> {
         let NetworkBuilder { mut network, request_handler, transactions, .. } = self;
         let (tx, rx) = mpsc::unbounded_channel();
         network.set_consensus(tx);
         let handle = network.handle().clone();
-        let consensus_manager = NetworkClayerManager::new(handle, consensus, rx);
+        let consensus_manager = NetworkClayerManager::new(handle, consensus_agent, rx);
         NetworkBuilder { network, request_handler, transactions, consensus_manager }
     }
 }

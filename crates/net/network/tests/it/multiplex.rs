@@ -1,6 +1,12 @@
+#![allow(unreachable_pub)]
 //! Testing gossiping of transactions.
 
-use crate::multiplex::proto::{PingPongProtoMessage, PingPongProtoMessageKind};
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    task::{ready, Context, Poll},
+};
+
 use futures::{Stream, StreamExt};
 use reth_eth_wire::{
     capability::SharedCapabilities, multiplex::ProtocolConnection, protocol::Protocol,
@@ -9,22 +15,18 @@ use reth_network::{
     protocol::{ConnectionHandler, OnNotSupported, ProtocolHandler},
     test_utils::Testnet,
 };
-use reth_network_api::Direction;
+use reth_network_api::{Direction, PeerId};
 use reth_primitives::BytesMut;
 use reth_provider::test_utils::MockEthProvider;
-use reth_rpc_types::PeerId;
-use std::{
-    net::SocketAddr,
-    pin::Pin,
-    task::{ready, Context, Poll},
-};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-/// A simple Rplx subprotocol for
+use crate::multiplex::proto::{PingPongProtoMessage, PingPongProtoMessageKind};
+
+/// A simple Rlpx subprotocol that sends pings and pongs
 mod proto {
     use super::*;
-    use reth_eth_wire::capability::Capability;
+    use reth_eth_wire::Capability;
     use reth_primitives::{Buf, BufMut};
 
     #[repr(u8)]
@@ -53,17 +55,17 @@ mod proto {
 
     impl PingPongProtoMessage {
         /// Returns the capability for the `ping` protocol.
-        pub fn capability() -> Capability {
+        pub const fn capability() -> Capability {
             Capability::new_static("ping", 1)
         }
 
         /// Returns the protocol for the `test` protocol.
-        pub fn protocol() -> Protocol {
+        pub const fn protocol() -> Protocol {
             Protocol::new(Self::capability(), 4)
         }
 
         /// Creates a ping message
-        pub fn ping() -> Self {
+        pub const fn ping() -> Self {
             Self {
                 message_type: PingPongProtoMessageId::Ping,
                 message: PingPongProtoMessageKind::Ping,
@@ -71,7 +73,7 @@ mod proto {
         }
 
         /// Creates a pong message
-        pub fn pong() -> Self {
+        pub const fn pong() -> Self {
             Self {
                 message_type: PingPongProtoMessageId::Pong,
                 message: PingPongProtoMessageKind::Pong,
@@ -98,11 +100,8 @@ mod proto {
             let mut buf = BytesMut::new();
             buf.put_u8(self.message_type as u8);
             match &self.message {
-                PingPongProtoMessageKind::Ping => {}
-                PingPongProtoMessageKind::Pong => {}
-                PingPongProtoMessageKind::PingMessage(msg) => {
-                    buf.put(msg.as_bytes());
-                }
+                PingPongProtoMessageKind::Ping | PingPongProtoMessageKind::Pong => {}
+                PingPongProtoMessageKind::PingMessage(msg) |
                 PingPongProtoMessageKind::PongMessage(msg) => {
                     buf.put(msg.as_bytes());
                 }
@@ -113,7 +112,7 @@ mod proto {
         /// Decodes a `TestProtoMessage` from the given message buffer.
         pub fn decode_message(buf: &mut &[u8]) -> Option<Self> {
             if buf.is_empty() {
-                return None;
+                return None
             }
             let id = buf[0];
             buf.advance(1);
@@ -166,9 +165,9 @@ struct ProtocolState {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 enum ProtocolEvent {
     Established {
+        #[allow(dead_code)]
         direction: Direction,
         peer_id: PeerId,
         to_connection: mpsc::UnboundedSender<Command>,
@@ -237,7 +236,7 @@ impl Stream for PingPongProtoConnection {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         if let Some(initial_ping) = this.initial_ping.take() {
-            return Poll::Ready(Some(initial_ping.encoded()));
+            return Poll::Ready(Some(initial_ping.encoded()))
         }
 
         loop {
@@ -249,21 +248,19 @@ impl Stream for PingPongProtoConnection {
                     }
                 }
             }
-            let Some(msg) = ready!(this.conn.poll_next_unpin(cx)) else {
-                return Poll::Ready(None);
-            };
+            let Some(msg) = ready!(this.conn.poll_next_unpin(cx)) else { return Poll::Ready(None) };
 
             let Some(msg) = PingPongProtoMessage::decode_message(&mut &msg[..]) else {
-                return Poll::Ready(None);
+                return Poll::Ready(None)
             };
 
             match msg.message {
                 PingPongProtoMessageKind::Ping => {
-                    return Poll::Ready(Some(PingPongProtoMessage::pong().encoded()));
+                    return Poll::Ready(Some(PingPongProtoMessage::pong().encoded()))
                 }
                 PingPongProtoMessageKind::Pong => {}
                 PingPongProtoMessageKind::PingMessage(msg) => {
-                    return Poll::Ready(Some(PingPongProtoMessage::pong_message(msg).encoded()));
+                    return Poll::Ready(Some(PingPongProtoMessage::pong_message(msg).encoded()))
                 }
                 PingPongProtoMessageKind::PongMessage(msg) => {
                     if let Some(sender) = this.pending_pong.take() {
@@ -273,7 +270,7 @@ impl Stream for PingPongProtoConnection {
                 }
             }
 
-            return Poll::Pending;
+            return Poll::Pending
         }
     }
 }

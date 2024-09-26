@@ -8,27 +8,30 @@ homepage.workspace = true
 repository.workspace = true
 description = "reth specific revm utilities"
 
+[lints]
+workspace = true
+
 [dependencies]
 # reth
+reth-chainspec.workspace = true
 reth-primitives.workspace = true
-reth-interfaces.workspace = true
-reth-provider.workspace = true
-reth-revm-inspectors.workspace = true
+reth-storage-errors.workspace = true
+reth-execution-errors.workspace = true
 reth-consensus-common.workspace = true
+reth-prune-types.workspace = true
+reth-storage-api.workspace = true
+reth-trie = { workspace = true, optional = true }
 
 # revm
 revm.workspace = true
 
-# common
-tracing.workspace = true
-
 [dev-dependencies]
 reth-trie.workspace = true
+reth-ethereum-forks.workspace = true
 
 [features]
-optimism = [
-  "revm/optimism",
-  "reth-primitives/optimism",
-  "reth-consensus-common/optimism",
-  "reth-interfaces/optimism",
-]
+default = ["std", "c-kzg"]
+std = []
+c-kzg = ["revm/c-kzg"]
+test-utils = ["dep:reth-trie"]
+optimism = ["revm/optimism"]

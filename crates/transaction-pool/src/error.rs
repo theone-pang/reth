@@ -1,6 +1,7 @@
 //! Transaction pool errors
 
-use reth_primitives::{Address, BlobTransactionValidationError, InvalidTransactionError, TxHash};
+use alloy_primitives::{Address, TxHash, U256};
+use reth_primitives::{BlobTransactionValidationError, InvalidTransactionError};
 
 /// Transaction pool result type.
 pub type PoolResult<T> = Result<T, PoolError>;
@@ -8,12 +9,12 @@ pub type PoolResult<T> = Result<T, PoolError>;
 /// A trait for additional errors that can be thrown by the transaction pool.
 ///
 /// For example during validation
-/// [TransactionValidator::validate_transaction](crate::validate::TransactionValidator::validate_transaction)
+/// [`TransactionValidator::validate_transaction`](crate::validate::TransactionValidator::validate_transaction)
 pub trait PoolTransactionError: std::error::Error + Send + Sync {
     /// Returns `true` if the error was caused by a transaction that is considered bad in the
     /// context of the transaction pool and warrants peer penalization.
     ///
-    /// See [PoolError::is_bad_transaction].
+    /// See [`PoolError::is_bad_transaction`].
     fn is_bad_transaction(&self) -> bool;
 }
 
@@ -82,7 +83,7 @@ impl PoolError {
     /// context of the transaction pool and warrants peer penalization.
     ///
     /// Not all error variants are caused by the incorrect composition of the transaction (See also
-    /// [InvalidPoolTransactionError]) and can be caused by the current state of the transaction
+    /// [`InvalidPoolTransactionError`]) and can be caused by the current state of the transaction
     /// pool. For example the transaction pool is already full or the error was caused my an
     /// internal error, such as database errors.
     ///
@@ -92,6 +93,7 @@ impl PoolError {
     /// erroneous transaction.
     #[inline]
     pub fn is_bad_transaction(&self) -> bool {
+        #[allow(clippy::match_same_arms)]
         match &self.kind {
             PoolErrorKind::AlreadyImported => {
                 // already imported but not bad
@@ -103,7 +105,7 @@ impl PoolError {
             }
             PoolErrorKind::FeeCapBelowMinimumProtocolFeeCap(_) => {
                 // fee cap of the tx below the technical minimum determined by the protocol, see
-                // [MINIMUM_PROTOCOL_FEE_CAP](reth_primitives::constants::MIN_PROTOCOL_BASE_FEE)
+                // [MINIMUM_PROTOCOL_FEE_CAP](alloy_primitives::constants::MIN_PROTOCOL_BASE_FEE)
                 // although this transaction will always be invalid, we do not want to penalize the
                 // sender because this check simply could not be implemented by the client
                 false
@@ -143,10 +145,10 @@ pub enum Eip4844PoolTransactionError {
     /// Thrown if we're unable to find the blob for a transaction that was previously extracted
     #[error("blob sidecar not found for EIP4844 transaction")]
     MissingEip4844BlobSidecar,
-    /// Thrown if an EIP-4844 without any blobs arrives
+    /// Thrown if an EIP-4844 transaction without any blobs arrives
     #[error("blobless blob transaction")]
     NoEip4844Blobs,
-    /// Thrown if an EIP-4844 without any blobs arrives
+    /// Thrown if an EIP-4844 transaction without any blobs arrives
     #[error("too many blobs in transaction: have {have}, permitted {permitted}")]
     TooManyEip4844Blobs {
         /// Number of blobs the transaction has
@@ -167,9 +169,18 @@ pub enum Eip4844PoolTransactionError {
     Eip4844NonceGap,
 }
 
+/// Represents all errors that can happen when validating transactions for the pool for EIP-7702
+/// transactions
+#[derive(Debug, thiserror::Error)]
+pub enum Eip7702PoolTransactionError {
+    /// Thrown if the transaction has no items in its authorization list
+    #[error("no items in authorization list for EIP7702 transaction")]
+    MissingEip7702AuthorizationList,
+}
+
 /// Represents errors that can happen when validating transactions for the pool
 ///
-/// See [TransactionValidator](crate::TransactionValidator).
+/// See [`TransactionValidator`](crate::TransactionValidator).
 #[derive(Debug, thiserror::Error)]
 pub enum InvalidPoolTransactionError {
     /// Hard consensus errors
@@ -180,7 +191,7 @@ pub enum InvalidPoolTransactionError {
     #[error("transaction's gas limit {0} exceeds block's gas limit {1}")]
     ExceedsGasLimit(u64, u64),
     /// Thrown when a new transaction is added to the pool, but then immediately discarded to
-    /// respect the max_init_code_size.
+    /// respect the `max_init_code_size`.
     #[error("transaction's size {0} exceeds max_init_code_size {1}")]
     ExceedsMaxInitCodeSize(usize, usize),
     /// Thrown if the input data of a transaction is greater
@@ -192,11 +203,19 @@ pub enum InvalidPoolTransactionError {
     #[error("transaction underpriced")]
     Underpriced,
     /// Thrown if the transaction's would require an account to be overdrawn
-    #[error("transaction overdraws from account")]
-    Overdraft,
-    /// Eip-4844 related errors
+    #[error("transaction overdraws from account, balance: {balance}, cost: {cost}")]
+    Overdraft {
+        /// Cost transaction is allowed to consume. See `reth_transaction_pool::PoolTransaction`.
+        cost: U256,
+        /// Balance of account.
+        balance: U256,
+    },
+    /// EIP-4844 related errors
     #[error(transparent)]
     Eip4844(#[from] Eip4844PoolTransactionError),
+    /// EIP-7702 related errors
+    #[error(transparent)]
+    Eip7702(#[from] Eip7702PoolTransactionError),
     /// Any other error that occurred while inserting/validating that is transaction specific
     #[error(transparent)]
     Other(Box<dyn PoolTransactionError>),
@@ -212,18 +231,19 @@ impl InvalidPoolTransactionError {
     /// Returns `true` if the error was caused by a transaction that is considered bad in the
     /// context of the transaction pool and warrants peer penalization.
     ///
-    /// See [PoolError::is_bad_transaction].
+    /// See [`PoolError::is_bad_transaction`].
+    #[allow(clippy::match_same_arms)]
     #[inline]
     fn is_bad_transaction(&self) -> bool {
         match self {
-            InvalidPoolTransactionError::Consensus(err) => {
+            Self::Consensus(err) => {
                 // transaction considered invalid by the consensus rules
                 // We do not consider the following errors to be erroneous transactions, since they
                 // depend on dynamic environmental conditions and should not be assumed to have been
                 // intentionally caused by the sender
                 match err {
                     InvalidTransactionError::InsufficientFunds { .. } |
-                    InvalidTransactionError::NonceNotConsistent => {
+                    InvalidTransactionError::NonceNotConsistent { .. } => {
                         // transaction could just have arrived late/early
                         false
                     }
@@ -239,28 +259,29 @@ impl InvalidPoolTransactionError {
                     }
                     InvalidTransactionError::Eip2930Disabled |
                     InvalidTransactionError::Eip1559Disabled |
-                    InvalidTransactionError::Eip4844Disabled => {
+                    InvalidTransactionError::Eip4844Disabled |
+                    InvalidTransactionError::Eip7702Disabled => {
                         // settings
                         false
                     }
-                    InvalidTransactionError::OldLegacyChainId => true,
-                    InvalidTransactionError::ChainIdMismatch => true,
-                    InvalidTransactionError::GasUintOverflow => true,
-                    InvalidTransactionError::TxTypeNotSupported => true,
+                    InvalidTransactionError::OldLegacyChainId |
+                    InvalidTransactionError::ChainIdMismatch |
+                    InvalidTransactionError::GasUintOverflow |
+                    InvalidTransactionError::TxTypeNotSupported |
                     InvalidTransactionError::SignerAccountHasBytecode => true,
                 }
             }
-            InvalidPoolTransactionError::ExceedsGasLimit(_, _) => true,
-            InvalidPoolTransactionError::ExceedsMaxInitCodeSize(_, _) => true,
-            InvalidPoolTransactionError::OversizedData(_, _) => true,
-            InvalidPoolTransactionError::Underpriced => {
+            Self::ExceedsGasLimit(_, _) => true,
+            Self::ExceedsMaxInitCodeSize(_, _) => true,
+            Self::OversizedData(_, _) => true,
+            Self::Underpriced => {
                 // local setting
                 false
             }
-            InvalidPoolTransactionError::IntrinsicGasTooLow => true,
-            InvalidPoolTransactionError::Overdraft => false,
-            InvalidPoolTransactionError::Other(err) => err.is_bad_transaction(),
-            InvalidPoolTransactionError::Eip4844(eip4844_err) => {
+            Self::IntrinsicGasTooLow => true,
+            Self::Overdraft { .. } => false,
+            Self::Other(err) => err.is_bad_transaction(),
+            Self::Eip4844(eip4844_err) => {
                 match eip4844_err {
                     Eip4844PoolTransactionError::MissingEip4844BlobSidecar => {
                         // this is only reachable when blob transactions are reinjected and we're
@@ -286,6 +307,15 @@ impl InvalidPoolTransactionError {
                     }
                 }
             }
+            Self::Eip7702(eip7702_err) => match eip7702_err {
+                Eip7702PoolTransactionError::MissingEip7702AuthorizationList => false,
+            },
         }
+    }
+
+    /// Returns `true` if an import failed due to nonce gap.
+    pub const fn is_nonce_gap(&self) -> bool {
+        matches!(self, Self::Consensus(InvalidTransactionError::NonceNotConsistent { .. })) ||
+            matches!(self, Self::Eip4844(Eip4844PoolTransactionError::Eip4844NonceGap))
     }
 }

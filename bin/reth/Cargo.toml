@@ -9,147 +9,113 @@ repository.workspace = true
 description = "Reth node implementation"
 default-run = "reth"
 
-[package.metadata.cargo-udeps.ignore]
-normal = [
-    # Used for diagrams in docs
-    "aquamarine",
-]
+[lints]
+workspace = true
 
 [dependencies]
 # reth
+reth-cli.workspace = true
+reth-chainspec.workspace = true
 reth-config.workspace = true
-reth-primitives = { workspace = true, features = ["arbitrary", "clap"] }
-reth-db = { workspace = true, features = ["mdbx", "test-utils"] }
-# TODO: Temporary use of the test-utils feature
-reth-provider = { workspace = true, features = ["test-utils"] }
+reth-primitives.workspace = true
+reth-fs-util.workspace = true
+reth-db = { workspace = true, features = ["mdbx"] }
+reth-db-api.workspace = true
+reth-exex.workspace = true
+reth-provider.workspace = true
+reth-evm.workspace = true
 reth-revm.workspace = true
-reth-revm-inspectors.workspace = true
 reth-stages.workspace = true
-reth-interfaces = { workspace = true, features = ["test-utils", "clap"] }
+reth-execution-types.workspace = true
+reth-errors.workspace = true
 reth-transaction-pool.workspace = true
 reth-beacon-consensus.workspace = true
-reth-auto-seal-consensus.workspace = true
+reth-cli-runner.workspace = true
+reth-cli-commands.workspace = true
+reth-cli-util.workspace = true
 reth-consensus-common.workspace = true
-reth-clayer.workspace = true
 reth-blockchain-tree.workspace = true
-reth-rpc-engine-api.workspace = true
 reth-rpc-builder.workspace = true
 reth-rpc.workspace = true
 reth-rpc-types.workspace = true
 reth-rpc-types-compat.workspace = true
 reth-rpc-api = { workspace = true, features = ["client"] }
+reth-rpc-eth-types.workspace = true
+reth-rpc-server-types.workspace = true
 reth-network = { workspace = true, features = ["serde"] }
+reth-network-p2p.workspace = true
 reth-network-api.workspace = true
-reth-downloaders = { workspace = true, features = ["test-utils"] }
+reth-downloaders.workspace = true
 reth-tracing.workspace = true
 reth-tasks.workspace = true
-reth-net-nat.workspace = true
 reth-payload-builder.workspace = true
+reth-payload-primitives.workspace = true
 reth-payload-validator.workspace = true
 reth-basic-payload-builder.workspace = true
-reth-discv4.workspace = true
+reth-static-file.workspace = true
+reth-trie = { workspace = true, features = ["metrics"] }
+reth-trie-db = { workspace = true, features = ["metrics"] }
+reth-node-api.workspace = true
+reth-node-core.workspace = true
+reth-ethereum-payload-builder.workspace = true
+reth-node-ethereum.workspace = true
+reth-node-builder.workspace = true
+reth-node-events.workspace = true
+reth-node-metrics.workspace = true
+reth-consensus.workspace = true
+reth-engine-util.workspace = true
 reth-prune.workspace = true
-reth-snapshot = { workspace = true, features = ["clap"] }
-reth-trie.workspace = true
-reth-nippy-jar.workspace = true
 
 # crypto
 alloy-rlp.workspace = true
-secp256k1 = { workspace = true, features = ["global-context", "rand-std", "recovery"] }
 
 # tracing
 tracing.workspace = true
 
 # io
-fdlimit = "0.3.0"
-serde.workspace = true
 serde_json.workspace = true
-shellexpand = "3.0.0"
-dirs-next = "2.0.0"
-confy.workspace = true
-toml = { workspace = true, features = ["display"] }
-
-# metrics
-metrics-exporter-prometheus = "0.12.1"
-metrics-util = "0.15.0"
-metrics-process = "1.0.9"
-reth-metrics.workspace = true
-metrics.workspace = true
-
-# test vectors generation
-proptest.workspace = true
-rand.workspace = true
-
-# tui
-comfy-table = "7.0"
-crossterm = "0.27.0"
-tui = "0.19.0"
-human_bytes = "0.4.1"
 
 # async
-tokio = { workspace = true, features = ["sync", "macros", "time", "rt-multi-thread"] }
+tokio = { workspace = true, features = [
+    "sync",
+    "macros",
+    "time",
+    "rt-multi-thread",
+] }
 futures.workspace = true
-pin-project.workspace = true
-
-# http/rpc
-hyper = "0.14.25"
 
 # misc
 aquamarine.workspace = true
 eyre.workspace = true
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "env"] }
+backon.workspace = true
+similar-asserts.workspace = true
+
+[dev-dependencies]
+reth-discv4.workspace = true
 tempfile.workspace = true
-backon = "0.4"
-thiserror.workspace = true
-pretty_assertions = "1.3.0"
-humantime = "2.1.0"
-const-str = "0.5.6"
-boyer-moore-magiclen = "0.2.16"
-itertools.workspace = true
-rayon.workspace = true
-
-[target.'cfg(not(windows))'.dependencies]
-jemallocator = { version = "0.5.0", optional = true }
-jemalloc-ctl = { version = "0.5.0", optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-procfs = { version = "0.16.0" }
 
 [features]
 default = ["jemalloc"]
-jemalloc = ["dep:jemallocator", "dep:jemalloc-ctl"]
-jemalloc-prof = ["jemalloc", "jemallocator?/profiling"]
+
+dev = ["reth-cli-commands/dev"]
+
+asm-keccak = ["reth-node-core/asm-keccak", "reth-primitives/asm-keccak"]
+
+jemalloc = [
+    "reth-cli-util/jemalloc",
+    "reth-node-core/jemalloc",
+    "reth-node-metrics/jemalloc",
+]
+jemalloc-prof = ["reth-cli-util/jemalloc"]
+tracy-allocator = ["reth-cli-util/tracy-allocator"]
+
 min-error-logs = ["tracing/release_max_level_error"]
 min-warn-logs = ["tracing/release_max_level_warn"]
 min-info-logs = ["tracing/release_max_level_info"]
 min-debug-logs = ["tracing/release_max_level_debug"]
 min-trace-logs = ["tracing/release_max_level_trace"]
-optimism = [
-    "reth-primitives/optimism",
-    "reth-revm/optimism",
-    "reth-interfaces/optimism",
-    "reth-rpc/optimism",
-    "reth-rpc-engine-api/optimism",
-    "reth-transaction-pool/optimism",
-    "reth-provider/optimism",
-    "reth-beacon-consensus/optimism",
-    "reth-auto-seal-consensus/optimism",
-    "reth-basic-payload-builder/optimism",
-    "reth-network/optimism",
-    "reth-network-api/optimism",
-    "reth-blockchain-tree/optimism",
-]
-# no-op feature flag for switching between the `optimism` and default functionality in CI matrices
-ethereum = []
-
-[build-dependencies]
-vergen = { version = "8.0.0", features = ["build", "cargo", "git", "gitcl"] }
 
 [[bin]]
 name = "reth"
 path = "src/main.rs"
-
-[[bin]]
-name = "op-reth"
-path = "src/optimism.rs"
-required-features = ["optimism"]

@@ -12,7 +12,7 @@ pub use zstd::{bulk::Decompressor, dict::DecoderDictionary};
 
 type RawDictionary = Vec<u8>;
 
-#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ZstdState {
     #[default]
     PendingDictionary,
@@ -40,7 +40,7 @@ pub struct Zstd {
 
 impl Zstd {
     /// Creates new [`Zstd`].
-    pub fn new(use_dict: bool, max_dict_size: usize, columns: usize) -> Self {
+    pub const fn new(use_dict: bool, max_dict_size: usize, columns: usize) -> Self {
         Self {
             state: if use_dict { ZstdState::PendingDictionary } else { ZstdState::Ready },
             level: 0,
@@ -51,7 +51,7 @@ impl Zstd {
         }
     }
 
-    pub fn with_level(mut self, level: i32) -> Self {
+    pub const fn with_level(mut self, level: i32) -> Self {
         self.level = level;
         self
     }
@@ -185,6 +185,7 @@ impl Compression for Zstd {
         matches!(self.state, ZstdState::Ready)
     }
 
+    #[cfg(test)]
     /// If using it with dictionaries, prepares a dictionary for each column.
     fn prepare_compression(
         &mut self,
@@ -208,7 +209,6 @@ impl Compression for Zstd {
             return Err(NippyJarError::ColumnLenMismatch(self.columns, columns.len()))
         }
 
-        // TODO: parallel calculation
         let mut dictionaries = vec![];
         for column in columns {
             // ZSTD requires all training data to be continuous in memory, alongside the size of
@@ -237,7 +237,7 @@ impl Compression for Zstd {
 mod dictionaries_serde {
     use super::*;
 
-    pub fn serialize<S>(
+    pub(crate) fn serialize<S>(
         dictionaries: &Option<Arc<ZstdDictionaries<'static>>>,
         serializer: S,
     ) -> Result<S::Ok, S::Error>
@@ -250,7 +250,7 @@ mod dictionaries_serde {
         }
     }
 
-    pub fn deserialize<'de, D>(
+    pub(crate) fn deserialize<'de, D>(
         deserializer: D,
     ) -> Result<Option<Arc<ZstdDictionaries<'static>>>, D::Error>
     where
@@ -264,7 +264,7 @@ mod dictionaries_serde {
 /// List of [`ZstdDictionary`]
 #[cfg_attr(test, derive(PartialEq))]
 #[derive(Serialize, Deserialize, Deref)]
-pub struct ZstdDictionaries<'a>(Vec<ZstdDictionary<'a>>);
+pub(crate) struct ZstdDictionaries<'a>(Vec<ZstdDictionary<'a>>);
 
 impl<'a> std::fmt::Debug for ZstdDictionaries<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -273,13 +273,14 @@ impl<'a> std::fmt::Debug for ZstdDictionaries<'a> {
 }
 
 impl<'a> ZstdDictionaries<'a> {
+    #[cfg(test)]
     /// Creates [`ZstdDictionaries`].
-    pub fn new(raw: Vec<RawDictionary>) -> Self {
+    pub(crate) fn new(raw: Vec<RawDictionary>) -> Self {
         Self(raw.into_iter().map(ZstdDictionary::Raw).collect())
     }
 
     /// Loads a list [`RawDictionary`] into a list of [`ZstdDictionary::Loaded`].
-    pub fn load(raw: Vec<RawDictionary>) -> Self {
+    pub(crate) fn load(raw: Vec<RawDictionary>) -> Self {
         Self(
             raw.into_iter()
                 .map(|dict| ZstdDictionary::Loaded(DecoderDictionary::copy(&dict)))
@@ -288,7 +289,7 @@ impl<'a> ZstdDictionaries<'a> {
     }
 
     /// Creates a list of decompressors from a list of [`ZstdDictionary::Loaded`].
-    pub fn decompressors(&self) -> Result<Vec<Decompressor<'_>>, NippyJarError> {
+    pub(crate) fn decompressors(&self) -> Result<Vec<Decompressor<'_>>, NippyJarError> {
         Ok(self
             .iter()
             .flat_map(|dict| {
@@ -300,7 +301,7 @@ impl<'a> ZstdDictionaries<'a> {
     }
 
     /// Creates a list of compressors from a list of [`ZstdDictionary::Raw`].
-    pub fn compressors(&self) -> Result<Vec<Compressor<'_>>, NippyJarError> {
+    pub(crate) fn compressors(&self) -> Result<Vec<Compressor<'_>>, NippyJarError> {
         Ok(self
             .iter()
             .flat_map(|dict| {
@@ -314,14 +315,15 @@ impl<'a> ZstdDictionaries<'a> {
 
 /// A Zstd dictionary. It's created and serialized with [`ZstdDictionary::Raw`], and deserialized as
 /// [`ZstdDictionary::Loaded`].
-pub enum ZstdDictionary<'a> {
+pub(crate) enum ZstdDictionary<'a> {
+    #[allow(dead_code)]
     Raw(RawDictionary),
     Loaded(DecoderDictionary<'a>),
 }
 
 impl<'a> ZstdDictionary<'a> {
     /// Returns a reference to the expected `RawDictionary`
-    pub fn raw(&self) -> Option<&RawDictionary> {
+    pub(crate) const fn raw(&self) -> Option<&RawDictionary> {
         match self {
             ZstdDictionary::Raw(dict) => Some(dict),
             ZstdDictionary::Loaded(_) => None,
@@ -329,7 +331,7 @@ impl<'a> ZstdDictionary<'a> {
     }
 
     /// Returns a reference to the expected `DecoderDictionary`
-    pub fn loaded(&self) -> Option<&DecoderDictionary<'_>> {
+    pub(crate) const fn loaded(&self) -> Option<&DecoderDictionary<'_>> {
         match self {
             ZstdDictionary::Raw(_) => None,
             ZstdDictionary::Loaded(dict) => Some(dict),
